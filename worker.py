@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sys
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from scraper.remax import RemaxScraper
@@ -16,6 +17,20 @@ from scraper.mercadolibre import MercadolibreScraper
 from db.models import Base, Inmueble, InmuebleSnapshot
 from scraper.mlscaracas import MLSCaracasScraper
 
+
+"""
+El Plan de Acción Final
+Con este cambio, tienes el control absoluto de tu software:
+
+Para el uso normal del día a día: Si solo quieres prender el orquestador para que espere al domingo, escribes python worker.py.
+
+Para la gran cosecha de hoy: Vas a combinar ambas herramientas (caffeinate y tu nueva bandera --seed).
+
+Ejecuta esto en tu terminal ahora mismo para arrancar:
+
+Bash
+caffeinate -i python worker.py --seed
+"""
 # Configuración básica de logs para ver qué hace el worker
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -129,7 +144,7 @@ async def job_rentahouse_caracas():
     scraper = RentAHouseScraper()
     try:
         # Prueba de 2 páginas (aprox 24-30 registros)
-        resultados = await scraper.run_pipeline(start_url, max_pages=2)
+        resultados = await scraper.run_pipeline(start_url)
         logger.info(f"Scraping RAH completado. {len(resultados)} inmuebles extraídos.")
 
         if resultados:
@@ -158,7 +173,7 @@ async def job_remax_caracas():
         for url in urls_remax:
             try:
                 # Intentamos procesar la zona
-                resultados_zona = await scraper.run_pipeline(url, max_pages=1)
+                resultados_zona = await scraper.run_pipeline(url)
                 todos_los_resultados.extend(resultados_zona)
                 # Pequeña pausa de 2 segundos para no saturar al servidor
                 await asyncio.sleep(2)
@@ -183,7 +198,7 @@ async def job_bolsainmobiliaria_caracas():
     scraper = BolsaInmobiliariaScraper()
     try:
         # Prueba de 2 páginas
-        resultados = await scraper.run_pipeline(start_url, max_pages=2)
+        resultados = await scraper.run_pipeline(start_url)
         logger.info(f"Scraping Bolsa Inmobiliaria completado. {len(resultados)} inmuebles extraídos.")
 
         if resultados:
@@ -200,7 +215,7 @@ async def job_quarto_caracas():
 
     scraper = QuartoScraper()
     try:
-        resultados = await scraper.run_pipeline(start_url, max_pages=1)  # Limitado a 1 pág por prueba
+        resultados = await scraper.run_pipeline(start_url)
         logger.info(f"Scraping Quarto completado. {len(resultados)} inmuebles extraídos.")
 
         if resultados:
@@ -218,7 +233,7 @@ async def job_vecindary_caracas():
 
     scraper = VecindaryScraper()
     try:
-        resultados = await scraper.run_pipeline(start_url, max_pages=1)
+        resultados = await scraper.run_pipeline(start_url)
         logger.info(f"Scraping Vecindary completado. {len(resultados)} inmuebles extraídos.")
 
         if resultados:
@@ -236,7 +251,7 @@ async def job_turesidencia_caracas():
     scraper = TuresidenciaScraper()
     try:
         # Limitado a 1 página para la prueba rápida
-        resultados = await scraper.run_pipeline(start_url, max_pages=1)
+        resultados = await scraper.run_pipeline(start_url)
         logger.info(f"Scraping TuResidencia completado. {len(resultados)} inmuebles extraídos.")
 
         if resultados:
@@ -254,7 +269,7 @@ async def job_mercadolibre_caracas():
     scraper = MercadolibreScraper()
     try:
         # Prueba de 1 página para validar la extracción
-        resultados = await scraper.run_pipeline(start_url, max_pages=1)
+        resultados = await scraper.run_pipeline(start_url)
         logger.info(f"Scraping Mercado Libre completado. {len(resultados)} inmuebles extraídos.")
 
         if resultados:
@@ -265,18 +280,10 @@ async def job_mercadolibre_caracas():
 
 
 async def main():
-    # Aseguramos que la DB exista antes de arrancar
     await init_db()
 
-    # Configuramos el planificador
+    # Configuramos el planificador semanal
     scheduler = AsyncIOScheduler()
-
-    # =================================================================
-    # ORQUESTADOR SEMANAL (PRODUCCIÓN)
-    # Ejecuta cada scraper 1 vez a la semana (Domingo) separado por 1 hora
-    # day_of_week='sun' significa Sunday (Domingo)
-    # =================================================================
-
     scheduler.add_job(job_mls_caracas, CronTrigger(day_of_week='sun', hour=2, minute=0))
     scheduler.add_job(job_rentahouse_caracas, CronTrigger(day_of_week='sun', hour=3, minute=0))
     scheduler.add_job(job_remax_caracas, CronTrigger(day_of_week='sun', hour=4, minute=0))
@@ -287,7 +294,25 @@ async def main():
     scheduler.add_job(job_mercadolibre_caracas, CronTrigger(day_of_week='sun', hour=9, minute=0))
 
     scheduler.start()
-    logger.info("Worker iniciado en MODO PRODUCCIÓN. Ejecución programada: Domingos desde las 02:00 AM.")
+
+    # =================================================================
+    # EL INTERRUPTOR: Solo entra aquí si escribimos "--seed" en la terminal
+    # =================================================================
+    if "--seed" in sys.argv:
+        logger.info("INICIANDO CARGA MASIVA INICIAL (--seed detectado)... Esto tomará horas.")
+
+        #await job_mls_caracas()
+        await job_rentahouse_caracas()
+        await job_remax_caracas()
+        await job_bolsainmobiliaria_caracas()
+        await job_quarto_caracas()
+        await job_vecindary_caracas()
+        await job_turesidencia_caracas()
+        #await job_mercadolibre_caracas()
+
+        logger.info("¡CARGA MASIVA FINALIZADA EXITOSAMENTE! El worker entra en modo reposo.")
+    else:
+        logger.info("Worker iniciado en MODO PRODUCCIÓN (Normal). Ejecución programada para los domingos.")
 
     # Mantenemos el proceso vivo en background
     try:
@@ -295,6 +320,8 @@ async def main():
             await asyncio.sleep(3600)
     except (KeyboardInterrupt, SystemExit):
         logger.info("Apagando worker...")
+
+
 
 if __name__ == "__main__":
     # Inicia el bucle de eventos asíncrono
