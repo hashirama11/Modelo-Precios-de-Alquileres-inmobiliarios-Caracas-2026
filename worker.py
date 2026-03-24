@@ -6,6 +6,7 @@ from scraper.remax import RemaxScraper
 from db.database import engine, AsyncSessionLocal
 from sqlalchemy.future import select
 from scraper.rentahouse import RentAHouseScraper
+from scraper.bolsainmobiliaria import BolsaInmobiliariaScraper
 
 # Importamos nuestros módulos (Ajusta las rutas según tu estructura exacta)
 from db.models import Base, Inmueble, InmuebleSnapshot
@@ -169,6 +170,25 @@ async def job_remax_caracas():
     except Exception as e:
         logger.error(f"Error durante la ejecución del job REMAX: {e}")
 
+
+async def job_bolsainmobiliaria_caracas():
+    logger.info("Iniciando Job: BolsaInmobiliariaScraper")
+
+    start_url = "https://bolsainmobiliariacaracas.com/s/apartamento/alquiler/venezuela/miranda-dtto-capital/caracas?id_country=95&id_region=3556&id_city=859026&id_property_type=2&business_type%5B%5D=for_rent"
+
+    scraper = BolsaInmobiliariaScraper()
+    try:
+        # Prueba de 2 páginas
+        resultados = await scraper.run_pipeline(start_url, max_pages=2)
+        logger.info(f"Scraping Bolsa Inmobiliaria completado. {len(resultados)} inmuebles extraídos.")
+
+        if resultados:
+            await procesar_y_guardar(resultados)
+
+    except Exception as e:
+        logger.error(f"Error durante la ejecución del job Bolsa Inmobiliaria: {e}")
+
+
 async def main():
     # Aseguramos que la DB exista antes de arrancar
     await init_db()
@@ -179,7 +199,8 @@ async def main():
     # Programamos la tarea para que se ejecute cada 6 horas
     #scheduler.add_job(job_mls_caracas, 'interval', hours=6, next_run_time=None)  # next_run_time=None evita que corra inmediatamente si no quieres
     #scheduler.add_job(job_rentahouse_caracas, CronTrigger(hour=3, minute=0))
-    scheduler.add_job(job_remax_caracas, CronTrigger(hour=3, minute=0))
+    #scheduler.add_job(job_remax_caracas, CronTrigger(hour=3, minute=0))
+    scheduler.add_job(job_bolsainmobiliaria_caracas, CronTrigger(hour=5, minute=0))
 
     scheduler.start()
     logger.info("Worker iniciado. Presiona Ctrl+C para salir.")
@@ -188,7 +209,8 @@ async def main():
     logger.info("Ejecutando primera prueba en seco...")
     #await job_mls_caracas()
     #await job_rentahouse_caracas()
-    await job_remax_caracas()
+    #await job_remax_caracas()
+    await job_bolsainmobiliaria_caracas()
 
     # Mantenemos el proceso vivo
     try:
