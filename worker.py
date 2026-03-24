@@ -1,8 +1,11 @@
 import asyncio
 import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
 from db.database import engine, AsyncSessionLocal
 from sqlalchemy.future import select
+from scraper.rentahouse import RentAHouseScraper
 
 # Importamos nuestros módulos (Ajusta las rutas según tu estructura exacta)
 from db.models import Base, Inmueble, InmuebleSnapshot
@@ -113,6 +116,23 @@ async def job_mls_caracas():
         logger.error(f"Error durante la ejecución del job: {e}")
 
 
+async def job_rentahouse_caracas():
+    logger.info("Iniciando Job: RentAHouseScraper")
+    # Tu URL exacta con filtros
+    start_url = "https://rentahouse.com.ve/propiedades_ubicadas_en_caracas.html?priceMin=0&priceMax=0&m2Min=0&m2Max=0&orderBy=entryTimestamp%20desc&country=venezuela&state=distrito-metropolitano&countrySlug=venezuela"
+
+    scraper = RentAHouseScraper()
+    try:
+        # Prueba de 2 páginas (aprox 24-30 registros)
+        resultados = await scraper.run_pipeline(start_url, max_pages=2)
+        logger.info(f"Scraping RAH completado. {len(resultados)} inmuebles extraídos.")
+
+        if resultados:
+            await procesar_y_guardar(resultados)
+
+    except Exception as e:
+        logger.error(f"Error durante la ejecución del job RAH: {e}")
+
 async def main():
     # Aseguramos que la DB exista antes de arrancar
     await init_db()
@@ -121,15 +141,16 @@ async def main():
     scheduler = AsyncIOScheduler()
 
     # Programamos la tarea para que se ejecute cada 6 horas
-    scheduler.add_job(job_mls_caracas, 'interval', hours=6,
-                      next_run_time=None)  # next_run_time=None evita que corra inmediatamente si no quieres
+    #scheduler.add_job(job_mls_caracas, 'interval', hours=6, next_run_time=None)  # next_run_time=None evita que corra inmediatamente si no quieres
+    scheduler.add_job(job_rentahouse_caracas, CronTrigger(hour=3, minute=0))
 
     scheduler.start()
     logger.info("Worker iniciado. Presiona Ctrl+C para salir.")
 
     # Como esta es la primera vez, vamos a forzar una ejecución manual de prueba
     logger.info("Ejecutando primera prueba en seco...")
-    await job_mls_caracas()
+    #await job_mls_caracas()
+    await job_rentahouse_caracas()
 
     # Mantenemos el proceso vivo
     try:
