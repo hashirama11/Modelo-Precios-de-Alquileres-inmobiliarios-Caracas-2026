@@ -9,6 +9,7 @@ from scraper.rentahouse import RentAHouseScraper
 from scraper.bolsainmobiliaria import BolsaInmobiliariaScraper
 from scraper.quarto import QuartoScraper
 from scraper.vecindary import VecindaryScraper
+from scraper.turesidencia import TuresidenciaScraper
 
 # Importamos nuestros módulos (Ajusta las rutas según tu estructura exacta)
 from db.models import Base, Inmueble, InmuebleSnapshot
@@ -226,6 +227,24 @@ async def job_vecindary_caracas():
         logger.error(f"Error durante la ejecución del job Vecindary: {e}")
 
 
+async def job_turesidencia_caracas():
+    logger.info("Iniciando Job: TuresidenciaScraper")
+
+    start_url = "https://www.turesidencia.net/habitaciones-alquiler/categories/11-habitaciones-en-alquiler-caracas/ads"
+
+    scraper = TuresidenciaScraper()
+    try:
+        # Limitado a 1 página para la prueba rápida
+        resultados = await scraper.run_pipeline(start_url, max_pages=1)
+        logger.info(f"Scraping TuResidencia completado. {len(resultados)} inmuebles extraídos.")
+
+        if resultados:
+            await procesar_y_guardar(resultados)
+
+    except Exception as e:
+        logger.error(f"Error durante la ejecución del job TuResidencia: {e}")
+
+
 async def main():
     # Aseguramos que la DB exista antes de arrancar
     await init_db()
@@ -239,7 +258,8 @@ async def main():
     #scheduler.add_job(job_remax_caracas, CronTrigger(hour=3, minute=0))
     #scheduler.add_job(job_bolsainmobiliaria_caracas, CronTrigger(hour=5, minute=0))
     #scheduler.add_job(job_quarto_caracas, CronTrigger(hour=6, minute=0))
-    scheduler.add_job(job_vecindary_caracas, CronTrigger(hour=7, minute=0))
+    #scheduler.add_job(job_vecindary_caracas, CronTrigger(hour=7, minute=0))
+    scheduler.add_job(job_turesidencia_caracas, CronTrigger(hour=8, minute=0))
 
     scheduler.start()
     logger.info("Worker iniciado. Presiona Ctrl+C para salir.")
@@ -251,7 +271,8 @@ async def main():
     #await job_remax_caracas()
     #await job_bolsainmobiliaria_caracas()
     #await job_quarto_caracas()
-    await job_vecindary_caracas()
+    #await job_vecindary_caracas()
+    await job_turesidencia_caracas()
 
     # Mantenemos el proceso vivo
     try:
