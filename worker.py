@@ -10,6 +10,7 @@ from scraper.bolsainmobiliaria import BolsaInmobiliariaScraper
 from scraper.quarto import QuartoScraper
 from scraper.vecindary import VecindaryScraper
 from scraper.turesidencia import TuresidenciaScraper
+from scraper.mercadolibre import MercadolibreScraper
 
 # Importamos nuestros módulos (Ajusta las rutas según tu estructura exacta)
 from db.models import Base, Inmueble, InmuebleSnapshot
@@ -245,6 +246,24 @@ async def job_turesidencia_caracas():
         logger.error(f"Error durante la ejecución del job TuResidencia: {e}")
 
 
+async def job_mercadolibre_caracas():
+    logger.info("Iniciando Job: MercadolibreScraper")
+
+    start_url = "https://listado.mercadolibre.com.ve/inmuebles/distrito-capital/alquiler_NoIndex_True#applied_filter_id%3Dstate%26applied_filter_name%3DUbicaci%C3%B3n%26applied_filter_order%3D5%26applied_value_id%3DTUxWUERJU2wxMzkxMA%26applied_value_name%3DDistrito+Capital%26applied_value_order%3D8%26applied_value_results%3D30500%26is_custom%3Dfalse"
+
+    scraper = MercadolibreScraper()
+    try:
+        # Prueba de 1 página para validar la extracción
+        resultados = await scraper.run_pipeline(start_url, max_pages=1)
+        logger.info(f"Scraping Mercado Libre completado. {len(resultados)} inmuebles extraídos.")
+
+        if resultados:
+            await procesar_y_guardar(resultados)
+
+    except Exception as e:
+        logger.error(f"Error durante la ejecución del job Mercado Libre: {e}")
+
+
 async def main():
     # Aseguramos que la DB exista antes de arrancar
     await init_db()
@@ -252,35 +271,30 @@ async def main():
     # Configuramos el planificador
     scheduler = AsyncIOScheduler()
 
-    # Programamos la tarea para que se ejecute cada 6 horas
-    #scheduler.add_job(job_mls_caracas, 'interval', hours=6, next_run_time=None)  # next_run_time=None evita que corra inmediatamente si no quieres
-    #scheduler.add_job(job_rentahouse_caracas, CronTrigger(hour=3, minute=0))
-    #scheduler.add_job(job_remax_caracas, CronTrigger(hour=3, minute=0))
-    #scheduler.add_job(job_bolsainmobiliaria_caracas, CronTrigger(hour=5, minute=0))
-    #scheduler.add_job(job_quarto_caracas, CronTrigger(hour=6, minute=0))
-    #scheduler.add_job(job_vecindary_caracas, CronTrigger(hour=7, minute=0))
-    scheduler.add_job(job_turesidencia_caracas, CronTrigger(hour=8, minute=0))
+    # =================================================================
+    # ORQUESTADOR SEMANAL (PRODUCCIÓN)
+    # Ejecuta cada scraper 1 vez a la semana (Domingo) separado por 1 hora
+    # day_of_week='sun' significa Sunday (Domingo)
+    # =================================================================
+
+    scheduler.add_job(job_mls_caracas, CronTrigger(day_of_week='sun', hour=2, minute=0))
+    scheduler.add_job(job_rentahouse_caracas, CronTrigger(day_of_week='sun', hour=3, minute=0))
+    scheduler.add_job(job_remax_caracas, CronTrigger(day_of_week='sun', hour=4, minute=0))
+    scheduler.add_job(job_bolsainmobiliaria_caracas, CronTrigger(day_of_week='sun', hour=5, minute=0))
+    scheduler.add_job(job_quarto_caracas, CronTrigger(day_of_week='sun', hour=6, minute=0))
+    scheduler.add_job(job_vecindary_caracas, CronTrigger(day_of_week='sun', hour=7, minute=0))
+    scheduler.add_job(job_turesidencia_caracas, CronTrigger(day_of_week='sun', hour=8, minute=0))
+    scheduler.add_job(job_mercadolibre_caracas, CronTrigger(day_of_week='sun', hour=9, minute=0))
 
     scheduler.start()
-    logger.info("Worker iniciado. Presiona Ctrl+C para salir.")
+    logger.info("Worker iniciado en MODO PRODUCCIÓN. Ejecución programada: Domingos desde las 02:00 AM.")
 
-    # Como esta es la primera vez, vamos a forzar una ejecución manual de prueba
-    logger.info("Ejecutando primera prueba en seco...")
-    #await job_mls_caracas()
-    #await job_rentahouse_caracas()
-    #await job_remax_caracas()
-    #await job_bolsainmobiliaria_caracas()
-    #await job_quarto_caracas()
-    #await job_vecindary_caracas()
-    await job_turesidencia_caracas()
-
-    # Mantenemos el proceso vivo
+    # Mantenemos el proceso vivo en background
     try:
         while True:
             await asyncio.sleep(3600)
     except (KeyboardInterrupt, SystemExit):
         logger.info("Apagando worker...")
-
 
 if __name__ == "__main__":
     # Inicia el bucle de eventos asíncrono
