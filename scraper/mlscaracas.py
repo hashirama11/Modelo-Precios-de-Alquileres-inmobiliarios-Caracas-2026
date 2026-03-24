@@ -5,6 +5,7 @@ El script se ejcutara en worker.py
 
 ## Dependencias
 import re
+import asyncio
 from playwright.async_api import async_playwright, Page
 from scraper.builder import PropertySnapshotBuilder
 
@@ -14,85 +15,151 @@ class MLSCaracasScraper:
         self.source_name = "mlscaracas"
         self.base_url = "https://mlscaracas.com"
 
-    async def run_pipeline(self, start_url: str, max_pages: int = 3):
-        """Punto de entrada principal para el Worker"""
-        resultados = []
+    async def run_pipeline(self, start_url: str, max_pages: int = None):
+        # NOTA: Agregamos max_pages=None para que navegue sin límite por defecto
+        resultados_validos = []
+
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
+            context = await browser.new_context()
+            page_lista = await context.new_page()
 
-            # 1. Recolectar URLs de las páginas de listado
-            urls_inmuebles = await self._recolectar_urls(page, start_url, max_pages)
+            print("Iniciando Fase A: Recolección de URLs...")
+            inmuebles_base = await self._recolectar_urls(page_lista, start_url, max_pages)
+            await page_lista.close()
+            print(f"Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
 
-            # 2. Visitar cada URL y extraer los detalles
-            for url in urls_inmuebles:
-                snapshot = await self._extraer_detalle(page, url)
-                if snapshot:
-                    resultados.append(snapshot)
+            print("Iniciando Fase B: Extracción de detalles (Concurrente)...")
+            semaforo = asyncio.Semaphore(3)
 
+            async def procesar_con_semaforo(item):
+                async with semaforo:
+                    nueva_pestaña = await context.new_page()
+                    try:
+                        # Pasamos también el título a la Fase B
+                        snapshot = await self._extraer_detalle(
+                            nueva_pestaña,
+                            item["url"],
+                            item.get("precio"),
+                            item.get("titulo")
+                        )
+                        return snapshot
+                    except Exception as e:
+                        print(f"Error fatal en {item.get('url', 'URL Desconocida')}: {e}")
+                        return None
+                    finally:
+                        await nueva_pestaña.close()
+
+            tareas = [procesar_con_semaforo(item) for item in inmuebles_base]
+            resultados_crudos = await asyncio.gather(*tareas)
+            resultados_validos = [r for r in resultados_crudos if r is not None]
+
+            await context.close()
             await browser.close()
-        return resultados
 
-    async def _recolectar_urls(self, page: Page, base_search_url: str, max_pages: int):
-        urls = []
-        for i in range(1, max_pages + 1):
-            # Observa cómo manejamos la paginación según tu análisis
-            paginated_url = f"{base_search_url}&page={i}"
-            await page.goto(paginated_url)
+        return resultados_validos
 
-            # Buscamos todos los enlaces dentro de los títulos de la lista
-            enlaces = await page.locator("h2.title-dot a").all()
-            for enlace in enlaces:
-                href = await enlace.get_attribute("href")
-                if href:
-                    urls.append(href)
-        return list(set(urls))  # Eliminar duplicados por si acaso
+    async def _recolectar_urls(self, page: Page, base_search_url: str, max_pages: int = None):
+        inmuebles_encontrados = []
+        urls_vistas = set()
 
-    async def _extraer_detalle(self, page: Page, url: str):
-        await page.goto(url)
+        current_url = base_search_url
+        paginas_escaneadas = 0
 
-        # 1. Extraer ID Externo (del HTML que me pasaste)
-        # Buscamos el <li> que contiene "Código:"
-        codigo_text = await page.locator("li:has-text('Código:')").inner_text()
-        external_id = codigo_text.replace("Código:", "").strip()  # Queda "1351436"
+        # Bucle While: Navega hasta que no haya más páginas o alcance el límite
+        while current_url:
+            if max_pages and paginas_escaneadas >= max_pages:
+                break
 
-        # 2. Inicializar el Builder
+            await page.goto(current_url, timeout=60000)
+            tarjetas = await page.locator("div.item").all()
+
+            for tarjeta in tarjetas:
+                enlace_loc = tarjeta.locator("h2.title-dot a")
+                if await enlace_loc.count() > 0:
+                    href = await enlace_loc.first.get_attribute("href")
+                    titulo = await enlace_loc.first.inner_text()  # NUEVO: Capturar título
+
+                    precio_limpio = None
+                    try:
+                        precio_text = await tarjeta.locator("span.pr2").inner_text(timeout=2000)
+                        precio_limpio = float(re.sub(r'[^\d.]', '', precio_text.replace(',', '')))
+                    except Exception:
+                        pass
+
+                    if href and href not in urls_vistas:
+                        urls_vistas.add(href)
+                        inmuebles_encontrados.append({
+                            "url": href,
+                            "precio": precio_limpio,
+                            "titulo": titulo  # NUEVO: Guardamos el título para la Fase B
+                        })
+
+            paginas_escaneadas += 1
+
+            # Lógica de Paginación Dinámica
+            siguiente_btn = page.locator("a.page-link[aria-label='Next']")
+            if await siguiente_btn.count() > 0:
+                current_url = await siguiente_btn.first.get_attribute("href")
+            else:
+                current_url = None  # Rompe el bucle, ya no hay botón Siguiente
+
+        return inmuebles_encontrados
+
+    # Añadimos titulo_base a los parámetros
+    async def _extraer_detalle(self, page: Page, url: str, precio_base: float, titulo_base: str):
+        await page.goto(url, timeout=60000)
+
+        try:
+            codigo_text = await page.locator("li:has-text('Código:')").inner_text(timeout=5000)
+            external_id = codigo_text.replace("Código:", "").strip()
+        except Exception:
+            return None
+
         builder = PropertySnapshotBuilder(source_name=self.source_name, external_id=external_id, url=url)
 
-        # 3. Extraer Precio (Requiere limpieza con expresiones regulares)
-        # Del fragmento: <span class="pr2">US$2,500 </span>
-        precio_text = await page.locator("span.pr2").inner_text()
-        precio_limpio = re.sub(r'[^\d.]', '', precio_text.replace(',', ''))  # Elimina US$ y comas
-        if precio_limpio:
-            builder.set_price(float(precio_limpio), "USD")
+        # Inyectamos el precio y el título extraídos en la Fase A
+        if precio_base:
+            builder.set_price(precio_base, "USD")
 
-        # 4. Extraer Ubicación
-        municipio = await page.locator("li:has-text('Municipio:')").inner_text()
-        urbanizacion = await page.locator("li:has-text('Urbanización:')").inner_text()
-        builder.set_location(
-            municipio=municipio.replace("Municipio:", "").strip(),
-            urbanismo=urbanizacion.replace("Urbanización:", "").strip()
-        )
+        # NUEVO: Enviamos el título y una descripción vacía por defecto
+        builder.set_general_info(titulo=titulo_base, descripcion=None)
 
-        # 5. Extraer Características (Área, Habitaciones, Baños)
-        area_text = await page.locator("li:has-text('Área Construida:')").inner_text()
-        habitaciones = await page.locator("li:has-text('Habitaciones:')").inner_text()
-        banos = await page.locator("li:has-text('Baño:')").inner_text()
+        # ... (Ubicación y Características se mantienen igual) ...
+        try:
+            municipio = await page.locator("li:has-text('Municipio:')").inner_text(timeout=3000)
+            urbanizacion = await page.locator("li:has-text('Urbanización:')").inner_text(timeout=3000)
+            builder.set_location(municipio=municipio.replace("Municipio:", "").strip(),
+                                 urbanismo=urbanizacion.replace("Urbanización:", "").strip())
+        except Exception:
+            pass
 
-        # Limpiamos los números
-        m2 = float(re.search(r'\d+', area_text).group()) if re.search(r'\d+', area_text) else None
-        habs = int(re.search(r'\d+', habitaciones).group()) if re.search(r'\d+', habitaciones) else None
+        try:
+            area_text = await page.locator("li:has-text('Área Construida:')").inner_text(timeout=3000)
+            m2 = float(re.search(r'\d+', area_text).group()) if re.search(r'\d+', area_text) else None
+            habitaciones_text = await page.locator("li:has-text('Habitaciones:')").inner_text(timeout=3000)
+            habs = int(re.search(r'\d+', habitaciones_text).group()) if re.search(r'\d+', habitaciones_text) else None
+            builder.add_features(m2_totales=m2, habitaciones=habs)
+        except Exception:
+            pass
 
-        builder.add_features(m2_totales=m2, habitaciones=habs)
+        # NUEVO: Extracción de descripción corregida
+        try:
+            # Tomamos el contenedor completo en lugar de un solo párrafo
+            desc_loc = page.locator("div.col-md-12:has(h3:has-text('Descripción Adicional'))")
+            descripcion_raw = await desc_loc.inner_text(timeout=3000)
+            # Limpiamos el título de la sección del texto resultante
+            descripcion_limpia = descripcion_raw.replace("Descripción Adicional", "").strip()
+            # Actualizamos la info general
+            builder.set_general_info(titulo=titulo_base, descripcion=descripcion_limpia)
+        except Exception:
+            pass
 
-        # 6. Extraer Descripción
-        descripcion = await page.locator("div.title:has(h3:has-text('Descripción Adicional')) + p").inner_text()
-        builder.set_general_info(descripcion=descripcion)
+        try:
+            features_items = await page.locator("div.list-info-2a ul li").all_inner_texts()
+            if features_items:
+                builder.add_extra_data("amenidades", features_items)
+        except Exception:
+            pass
 
-        # 7. Listas de características internas/externas (Extra data)
-        # Aquí recolectamos todos los <li> de las listas de características y las guardamos crudas
-        features_items = await page.locator("div.list-info-2a ul li").all_inner_texts()
-        builder.add_extra_data("amenidades", features_items)  # Guarda la lista entera en el JSON
-
-        # Finalmente, retornamos el modelo validado
         return builder.build()
