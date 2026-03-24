@@ -2,7 +2,7 @@ import asyncio
 import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-
+from scraper.remax import RemaxScraper
 from db.database import engine, AsyncSessionLocal
 from sqlalchemy.future import select
 from scraper.rentahouse import RentAHouseScraper
@@ -133,6 +133,42 @@ async def job_rentahouse_caracas():
     except Exception as e:
         logger.error(f"Error durante la ejecución del job RAH: {e}")
 
+
+async def job_remax_caracas():
+    logger.info("Iniciando Job: RemaxScraper")
+
+    # Las 5 URLs de las distintas zonas de Caracas
+    urls_remax = [
+        "https://www.remax.com.ve/inmuebles/apartamento/alquiler?ubi=Caracas%2C+Baruta%2C+Miranda%2C+VEN",
+        "https://www.remax.com.ve/inmuebles/apartamento/alquiler?ubi=Caracas%2C+Chacao%2C+Miranda%2C+VEN",
+        "https://www.remax.com.ve/inmuebles/apartamento/alquiler?ubi=Caracas%2C+Libertador%2C+Distrito+Capital%2C+VEN",
+        "https://www.remax.com.ve/inmuebles/apartamento/alquiler?ubi=Caracas%2C+Sucre%2C+Miranda%2C+VEN",
+        "https://www.remax.com.ve/inmuebles/apartamento/alquiler?ubi=Caracas%2C+El+Hatillo%2C+Miranda%2C+VEN"
+    ]
+
+    scraper = RemaxScraper()
+    todos_los_resultados = []
+
+    try:
+        for url in urls_remax:
+            try:
+                # Intentamos procesar la zona
+                resultados_zona = await scraper.run_pipeline(url, max_pages=1)
+                todos_los_resultados.extend(resultados_zona)
+                # Pequeña pausa de 2 segundos para no saturar al servidor
+                await asyncio.sleep(2)
+            except Exception as e:
+                logger.error(f"⚠️ Error en zona {url}: {e}. Continuando con la siguiente...")
+                continue  # Si una zona falla, no detiene el Job completo
+
+        logger.info(f"Scraping REMAX completado. {len(todos_los_resultados)} inmuebles.")
+
+        if todos_los_resultados:
+            await procesar_y_guardar(todos_los_resultados)
+
+    except Exception as e:
+        logger.error(f"Error durante la ejecución del job REMAX: {e}")
+
 async def main():
     # Aseguramos que la DB exista antes de arrancar
     await init_db()
@@ -142,7 +178,8 @@ async def main():
 
     # Programamos la tarea para que se ejecute cada 6 horas
     #scheduler.add_job(job_mls_caracas, 'interval', hours=6, next_run_time=None)  # next_run_time=None evita que corra inmediatamente si no quieres
-    scheduler.add_job(job_rentahouse_caracas, CronTrigger(hour=3, minute=0))
+    #scheduler.add_job(job_rentahouse_caracas, CronTrigger(hour=3, minute=0))
+    scheduler.add_job(job_remax_caracas, CronTrigger(hour=3, minute=0))
 
     scheduler.start()
     logger.info("Worker iniciado. Presiona Ctrl+C para salir.")
@@ -150,7 +187,8 @@ async def main():
     # Como esta es la primera vez, vamos a forzar una ejecución manual de prueba
     logger.info("Ejecutando primera prueba en seco...")
     #await job_mls_caracas()
-    await job_rentahouse_caracas()
+    #await job_rentahouse_caracas()
+    await job_remax_caracas()
 
     # Mantenemos el proceso vivo
     try:
