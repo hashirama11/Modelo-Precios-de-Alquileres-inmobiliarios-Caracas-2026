@@ -1,0 +1,57 @@
+# =========================
+# BASES DE DATOS Y DATOS
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+*.parquet
+
+# =========================
+# ENTORNO PYTHON
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+env/
+.venv/
+miniconda3/
+
+# =========================
+# VARIABLES DE ENTORNO (Secretos)
+# =========================
+.env
+.env.*
+*.pem
+
+# =========================
+# JUPYTER NOTEBOOKS
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# MACHINE LEARNING / MODELOS
+# =========================
+# (Ignoramos binarios pesados que guardes en la carpeta models)
+*.pkl
+*.joblib
+*.h5
+*.model
+
+# =========================
+# IDEs Y CONFIGURACIONES
+# =========================
+.idea/
+.vscode/
+*.swp
+
+# =========================
+# SISTEMA OPERATIVO (macOS)
+# =========================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
