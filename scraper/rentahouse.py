@@ -3,54 +3,94 @@ import re
 from urllib.parse import urljoin
 from playwright.async_api import async_playwright, Page
 from scraper.builder import PropertySnapshotBuilder
-
+from scraper.utils import optimizar_pagina
 
 class RentAHouseScraper:
     def __init__(self):
         self.source_name = "rentahouse"
         self.base_url = "https://rentahouse.com.ve"
 
-    async def run_pipeline(self, start_url: str, max_pages: int = None):
-        resultados_validos = []
+    async def run_pipeline(self, start_url: str, max_pages: int = None, save_callback=None):
+        resultados_totales = 0
 
+        # ==========================================
+        # FASE A: RECOLECCIÓN DE URLs
+        # ==========================================
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context()
             page_lista = await context.new_page()
 
-            print(f"[{self.source_name}] Iniciando Fase A: Recolección de URLs...")
+            await optimizar_pagina(page_lista)
+
+            print(f"[{self.source_name}] Fase A: Recolección de URLs...")
             inmuebles_base = await self._recolectar_urls(page_lista, start_url, max_pages)
+
+            # ¡CRÍTICO! Cerramos el navegador de la Fase A para liberar RAM inicial
             await page_lista.close()
-            print(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
-
-            print(f"[{self.source_name}] Iniciando Fase B: Extracción de detalles (Concurrente)...")
-            semaforo = asyncio.Semaphore(3)
-
-            async def procesar_con_semaforo(item):
-                async with semaforo:
-                    nueva_pestaña = await context.new_page()
-                    try:
-                        snapshot = await self._extraer_detalle(
-                            nueva_pestaña,
-                            item["url"],
-                            item.get("precio"),
-                            item.get("titulo")
-                        )
-                        return snapshot
-                    except Exception as e:
-                        print(f"Error fatal en {item.get('url')}: {e}")
-                        return None
-                    finally:
-                        await nueva_pestaña.close()
-
-            tareas = [procesar_con_semaforo(item) for item in inmuebles_base]
-            resultados_crudos = await asyncio.gather(*tareas)
-            resultados_validos = [r for r in resultados_crudos if r is not None]
-
             await context.close()
             await browser.close()
 
-        return resultados_validos
+            print(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
+
+        if not inmuebles_base:
+            return 0
+
+        # ==========================================
+        # FASE B: EXTRACCIÓN POR LOTES (MICRO-BATCHING)
+        # ==========================================
+        tamaño_lote = 100  # Procesaremos de 100 en 100
+        total_lotes = (len(inmuebles_base) // tamaño_lote) + 1
+
+        for i in range(0, len(inmuebles_base), tamaño_lote):
+            lote_actual = inmuebles_base[i: i + tamaño_lote]
+            num_lote = (i // tamaño_lote) + 1
+            print(f"[{self.source_name}] Procesando Lote {num_lote}/{total_lotes} ({len(lote_actual)} inmuebles)...")
+
+            # Abrimos un navegador NUEVO y FRESCO solo para este lote
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context()
+                semaforo = asyncio.Semaphore(3)  # 3 pestañas concurrentes a la vez
+
+                async def procesar_con_semaforo(item):
+                    async with semaforo:
+                        nueva_pestaña = await context.new_page()
+
+                        await optimizar_pagina(page_lista)
+
+                        try:
+                            snapshot = await self._extraer_detalle(
+                                nueva_pestaña,
+                                item["url"],
+                                item.get("precio"),
+                                item.get("titulo")
+                            )
+                            return snapshot
+                        except Exception as e:
+                            print(f"Error en {item.get('url')}: {e}")
+                            return None
+                        finally:
+                            await nueva_pestaña.close()
+
+                tareas = [procesar_con_semaforo(item) for item in lote_actual]
+                resultados_crudos = await asyncio.gather(*tareas)
+                resultados_validos = [r for r in resultados_crudos if r is not None]
+
+                # ¡GUARDADO INMEDIATO EN LA BASE DE DATOS!
+                if save_callback and resultados_validos:
+                    await save_callback(resultados_validos)
+                    resultados_totales += len(resultados_validos)
+
+                # ¡CRÍTICO! Cerramos el navegador para vaciar la memoria RAM
+                await context.close()
+                await browser.close()
+
+            # Pequeño respiro de 5 segundos para no saturar al servidor destino
+            print(f"[{self.source_name}] Lote {num_lote} finalizado. RAM limpiada. Descansando 5s...")
+            await asyncio.sleep(5)
+
+        return resultados_totales
 
     async def _recolectar_urls(self, page: Page, base_search_url: str, max_pages: int = None):
         inmuebles_encontrados = []
