@@ -4,6 +4,10 @@ from urllib.parse import urljoin
 from playwright.async_api import async_playwright, Page
 from scraper.builder import PropertySnapshotBuilder
 from scraper.utils import optimizar_pagina
+import logging
+
+# Instanciamos el logger
+logger = logging.getLogger(__name__)
 
 class RentAHouseScraper:
     def __init__(self):
@@ -23,7 +27,7 @@ class RentAHouseScraper:
 
             await optimizar_pagina(page_lista)
 
-            print(f"[{self.source_name}] Fase A: Recolección de URLs...")
+            logger.info(f"[{self.source_name}] Fase A: Recolección de URLs iniciada...")
             inmuebles_base = await self._recolectar_urls(page_lista, start_url, max_pages)
 
             # ¡CRÍTICO! Cerramos el navegador de la Fase A para liberar RAM inicial
@@ -31,9 +35,10 @@ class RentAHouseScraper:
             await context.close()
             await browser.close()
 
-            print(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
+            logger.info(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
 
         if not inmuebles_base:
+            logger.warning(f"[{self.source_name}] No se encontraron URLs para procesar.")
             return 0
 
         # ==========================================
@@ -45,7 +50,7 @@ class RentAHouseScraper:
         for i in range(0, len(inmuebles_base), tamaño_lote):
             lote_actual = inmuebles_base[i: i + tamaño_lote]
             num_lote = (i // tamaño_lote) + 1
-            print(f"[{self.source_name}] Procesando Lote {num_lote}/{total_lotes} ({len(lote_actual)} inmuebles)...")
+            logger.info(f"[{self.source_name}] ⏳ Procesando Lote {num_lote}/{total_lotes} ({len(lote_actual)} URLs)...")
 
             # Abrimos un navegador NUEVO y FRESCO solo para este lote
             async with async_playwright() as p:
@@ -57,18 +62,19 @@ class RentAHouseScraper:
                     async with semaforo:
                         nueva_pestaña = await context.new_page()
 
-                        await optimizar_pagina(page_lista)
+                        # BUG CORREGIDO: Aplicamos optimización a la nueva pestaña
+                        await optimizar_pagina(nueva_pestaña)
 
                         try:
                             snapshot = await self._extraer_detalle(
                                 nueva_pestaña,
                                 item["url"],
-                                item.get("precio"),
-                                item.get("titulo")
+                                item.get("precio", None),
+                                item.get("titulo", "")
                             )
                             return snapshot
                         except Exception as e:
-                            print(f"Error en {item.get('url')}: {e}")
+                            logger.error(f"[{self.source_name}] Error en {item.get('url')}: {e}")
                             return None
                         finally:
                             await nueva_pestaña.close()
@@ -87,9 +93,10 @@ class RentAHouseScraper:
                 await browser.close()
 
             # Pequeño respiro de 5 segundos para no saturar al servidor destino
-            print(f"[{self.source_name}] Lote {num_lote} finalizado. RAM limpiada. Descansando 5s...")
+            logger.info(f"[{self.source_name}] ✅ Lote {num_lote} finalizado y guardado en BD. Descansando 5s...")
             await asyncio.sleep(5)
 
+        logger.info(f"[{self.source_name}] 🎉 Pipeline completado. {resultados_totales} inmuebles procesados exitosamente.")
         return resultados_totales
 
     async def _recolectar_urls(self, page: Page, base_search_url: str, max_pages: int = None):
@@ -102,6 +109,7 @@ class RentAHouseScraper:
             if max_pages and paginas_escaneadas >= max_pages:
                 break
 
+            logger.debug(f"[{self.source_name}] Escaneando página: {current_url}")
             await page.goto(current_url, timeout=60000)
             # Buscamos las tarjetas de propiedades (según tu HTML)
             tarjetas = await page.locator("div.property-list").all()

@@ -9,6 +9,11 @@ import asyncio
 from playwright.async_api import async_playwright, Page
 from scraper.builder import PropertySnapshotBuilder
 from scraper.utils import optimizar_pagina
+import logging
+
+# Instanciamos el logger
+logger = logging.getLogger(__name__)
+
 
 class MLSCaracasScraper:
     def __init__(self):
@@ -20,22 +25,22 @@ class MLSCaracasScraper:
 
         # --- FASE A: RECOLECCIÓN DE URLs ---
         async with async_playwright() as p:
-            # NOTA: En mercadolibre y quarto, recuerda usar headless=False y el user_agent aquí si lo configuraste
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context()
             page_lista = await context.new_page()
 
             await optimizar_pagina(page_lista)
 
-            print(f"[{self.source_name}] Fase A: Recolección de URLs...")
+            logger.info(f"[{self.source_name}] Fase A: Recolección de URLs iniciada...")
             inmuebles_base = await self._recolectar_urls(page_lista, start_url, max_pages)
 
             await page_lista.close()
             await context.close()
             await browser.close()
-            print(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
+            logger.info(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
 
         if not inmuebles_base:
+            logger.warning(f"[{self.source_name}] No se encontraron URLs para procesar.")
             return 0
 
         # --- FASE B: EXTRACCIÓN POR LOTES (MICRO-BATCHING) ---
@@ -45,7 +50,7 @@ class MLSCaracasScraper:
         for i in range(0, len(inmuebles_base), tamaño_lote):
             lote_actual = inmuebles_base[i: i + tamaño_lote]
             num_lote = (i // tamaño_lote) + 1
-            print(f"[{self.source_name}] Procesando Lote {num_lote}/{total_lotes} ({len(lote_actual)} inmuebles)...")
+            logger.info(f"[{self.source_name}] ⏳ Procesando Lote {num_lote}/{total_lotes} ({len(lote_actual)} URLs)...")
 
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
@@ -56,12 +61,10 @@ class MLSCaracasScraper:
                     async with semaforo:
                         nueva_pestaña = await context.new_page()
 
-                        await optimizar_pagina(page_lista)
+                        # BUG CORREGIDO: Aplicamos optimización a la nueva pestaña
+                        await optimizar_pagina(nueva_pestaña)
 
                         try:
-                            # Dependiendo del scraper, _extraer_detalle recibe diferentes parámetros.
-                            # Revisa cómo era en el original (ej: item.get("precio"), item.get("titulo"))
-                            # y ajústalo aquí si es necesario.
                             snapshot = await self._extraer_detalle(
                                 nueva_pestaña,
                                 item["url"],
@@ -70,7 +73,7 @@ class MLSCaracasScraper:
                             )
                             return snapshot
                         except Exception as e:
-                            print(f"Error en {item.get('url')}: {e}")
+                            logger.error(f"[{self.source_name}] Error en {item.get('url')}: {e}")
                             return None
                         finally:
                             await nueva_pestaña.close()
@@ -87,9 +90,11 @@ class MLSCaracasScraper:
                 await context.close()
                 await browser.close()
 
-            print(f"[{self.source_name}] Lote {num_lote} guardado en BD. RAM liberada. Descanso...")
+            logger.info(f"[{self.source_name}] ✅ Lote {num_lote} guardado en BD. RAM liberada. Descansando 3s...")
             await asyncio.sleep(3)  # Pausa entre lotes
 
+        logger.info(
+            f"[{self.source_name}] 🎉 Pipeline completado. {resultados_totales} inmuebles procesados exitosamente.")
         return resultados_totales
 
     async def _recolectar_urls(self, page: Page, base_search_url: str, max_pages: int = None):
@@ -104,6 +109,7 @@ class MLSCaracasScraper:
             if max_pages and paginas_escaneadas >= max_pages:
                 break
 
+            logger.debug(f"[{self.source_name}] Escaneando página: {current_url}")
             await page.goto(current_url, timeout=60000)
             tarjetas = await page.locator("div.item").all()
 

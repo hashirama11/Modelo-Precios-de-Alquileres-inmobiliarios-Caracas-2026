@@ -4,6 +4,10 @@ from urllib.parse import urljoin
 from playwright.async_api import async_playwright, Page
 from scraper.builder import PropertySnapshotBuilder
 from scraper.utils import optimizar_pagina
+import logging
+
+# Instanciamos el logger
+logger = logging.getLogger(__name__)
 
 class TuresidenciaScraper:
     def __init__(self):
@@ -15,22 +19,22 @@ class TuresidenciaScraper:
 
         # --- FASE A: RECOLECCIÓN DE URLs ---
         async with async_playwright() as p:
-            # NOTA: En mercadolibre y quarto, recuerda usar headless=False y el user_agent aquí si lo configuraste
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context()
             page_lista = await context.new_page()
 
             await optimizar_pagina(page_lista)
 
-            print(f"[{self.source_name}] Fase A: Recolección de URLs...")
+            logger.info(f"[{self.source_name}] Fase A: Recolección de URLs iniciada...")
             inmuebles_base = await self._recolectar_urls(page_lista, start_url, max_pages)
 
             await page_lista.close()
             await context.close()
             await browser.close()
-            print(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
+            logger.info(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
 
         if not inmuebles_base:
+            logger.warning(f"[{self.source_name}] No se encontraron URLs para procesar.")
             return 0
 
         # --- FASE B: EXTRACCIÓN POR LOTES (MICRO-BATCHING) ---
@@ -40,7 +44,7 @@ class TuresidenciaScraper:
         for i in range(0, len(inmuebles_base), tamaño_lote):
             lote_actual = inmuebles_base[i: i + tamaño_lote]
             num_lote = (i // tamaño_lote) + 1
-            print(f"[{self.source_name}] Procesando Lote {num_lote}/{total_lotes} ({len(lote_actual)} inmuebles)...")
+            logger.info(f"[{self.source_name}] ⏳ Procesando Lote {num_lote}/{total_lotes} ({len(lote_actual)} URLs)...")
 
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
@@ -51,21 +55,19 @@ class TuresidenciaScraper:
                     async with semaforo:
                         nueva_pestaña = await context.new_page()
 
-                        await optimizar_pagina(page_lista)
+                        # BUG CORREGIDO: Optimizamos la nueva pestaña, no la vieja page_lista
+                        await optimizar_pagina(nueva_pestaña)
 
                         try:
-                            # Dependiendo del scraper, _extraer_detalle recibe diferentes parámetros.
-                            # Revisa cómo era en el original (ej: item.get("precio"), item.get("titulo"))
-                            # y ajústalo aquí si es necesario.
                             snapshot = await self._extraer_detalle(
                                 nueva_pestaña,
                                 item["url"],
-                                item.get("precio", None),
+                                item.get("precio", None), # Se agregó precio_base
                                 item.get("titulo", "")
                             )
                             return snapshot
                         except Exception as e:
-                            print(f"Error en {item.get('url')}: {e}")
+                            logger.error(f"[{self.source_name}] Error en {item.get('url')}: {e}")
                             return None
                         finally:
                             await nueva_pestaña.close()
@@ -82,9 +84,10 @@ class TuresidenciaScraper:
                 await context.close()
                 await browser.close()
 
-            print(f"[{self.source_name}] Lote {num_lote} guardado en BD. RAM liberada. Descanso...")
-            await asyncio.sleep(3)  # Pausa entre lotes
+            logger.info(f"[{self.source_name}] ✅ Lote {num_lote} guardado en BD. RAM liberada. Descansando 3s...")
+            await asyncio.sleep(3)
 
+        logger.info(f"[{self.source_name}] 🎉 Pipeline completado. {resultados_totales} inmuebles procesados.")
         return resultados_totales
 
     async def _recolectar_urls(self, page: Page, base_search_url: str, max_pages: int = None):
@@ -97,9 +100,9 @@ class TuresidenciaScraper:
             if max_pages and paginas_escaneadas >= max_pages:
                 break
 
+            logger.debug(f"[{self.source_name}] Escaneando página: {current_url}")
             await page.goto(current_url, timeout=60000)
 
-            # Selector para las tarjetas de la lista
             tarjetas = await page.locator("div.gb_wrapper").all()
 
             for tarjeta in tarjetas:
@@ -124,7 +127,6 @@ class TuresidenciaScraper:
 
             paginas_escaneadas += 1
 
-            # Paginación
             siguiente_btn = page.locator("a[title='Próximo']")
             if await siguiente_btn.count() > 0:
                 relative_url = await siguiente_btn.first.get_attribute("href")
@@ -134,7 +136,8 @@ class TuresidenciaScraper:
 
         return inmuebles_encontrados
 
-    async def _extraer_detalle(self, page: Page, url: str, titulo_base: str):
+    # BUG CORREGIDO: Se agregó precio_base a los parámetros
+    async def _extraer_detalle(self, page: Page, url: str, precio_base: float, titulo_base: str):
         await page.goto(url, timeout=60000)
 
         # 1. Extraer ID
@@ -169,7 +172,7 @@ class TuresidenciaScraper:
             partes = [p.strip() for p in ubicacion_text.split("\n") if p.strip()]
 
             urbanismo = partes[0] if partes else ""
-            municipio = "Caracas"  # Fallback
+            municipio = "Caracas"
             if len(partes) > 1:
                 sub_partes = partes[1].split(",")
                 if len(sub_partes) >= 3:
@@ -179,25 +182,24 @@ class TuresidenciaScraper:
         except Exception:
             pass
 
-        # 5. Precio (Intento directo y Fallback con Regex)
-        precio_limpio = None
-        try:
-            precio_text = await page.locator(
-                "li:has(div.gb_ad_heading:has-text('Precio')) div.gb_ad_heading_details").inner_text(timeout=3000)
-            precio_str = re.sub(r'[^\d]', '', precio_text)
+        # 5. Precio
+        precio_limpio = precio_base
+        if not precio_limpio:
+            try:
+                precio_text = await page.locator(
+                    "li:has(div.gb_ad_heading:has-text('Precio')) div.gb_ad_heading_details").inner_text(timeout=3000)
+                precio_str = re.sub(r'[^\d]', '', precio_text)
 
-            if precio_str:
-                precio_limpio = float(precio_str)
-            else:
-                # FALLBACK: Si dice "En Negociacion", buscamos en la descripción algo como "250 $" o "$ 250"
-                if descripcion_limpia:
+                if precio_str:
+                    precio_limpio = float(precio_str)
+                elif descripcion_limpia:
                     match = re.search(r'(?:usd|\$)\s*(\d+[\d\.,]*)|(\d+[\d\.,]*)\s*(?:usd|\$)',
                                       descripcion_limpia.lower())
                     if match:
                         num_str = match.group(1) if match.group(1) else match.group(2)
                         precio_limpio = float(num_str.replace(',', '').replace('.', ''))
-        except Exception:
-            pass
+            except Exception:
+                pass
 
         if precio_limpio:
             builder.set_price(precio_limpio, "USD")

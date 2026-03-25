@@ -4,33 +4,41 @@ from urllib.parse import urljoin
 from playwright.async_api import async_playwright, Page
 from scraper.builder import PropertySnapshotBuilder
 from scraper.utils import optimizar_pagina
+import logging
+
+# Instanciamos el logger
+logger = logging.getLogger(__name__)
+
 
 class QuartoScraper:
     def __init__(self):
         self.source_name = "quarto"
         self.base_url = "https://quartoapp.com"
+        # Disfrazamos a nuestro bot con un User-Agent estándar de Mac
+        self.user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
     async def run_pipeline(self, start_url: str, max_pages: int = None, save_callback=None):
         resultados_totales = 0
 
         # --- FASE A: RECOLECCIÓN DE URLs ---
         async with async_playwright() as p:
-            # NOTA: En mercadolibre y quarto, recuerda usar headless=False y el user_agent aquí si lo configuraste
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context()
+            # QUARTO: Usamos headless=False y User-Agent porque al ser React/SPA suelen bloquear bots invisibles
+            browser = await p.chromium.launch(headless=False)
+            context = await browser.new_context(user_agent=self.user_agent)
             page_lista = await context.new_page()
 
             await optimizar_pagina(page_lista)
 
-            print(f"[{self.source_name}] Fase A: Recolección de URLs...")
+            logger.info(f"[{self.source_name}] Fase A: Recolección de URLs iniciada (Modo Visible SPA)...")
             inmuebles_base = await self._recolectar_urls(page_lista, start_url, max_pages)
 
             await page_lista.close()
             await context.close()
             await browser.close()
-            print(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
+            logger.info(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
 
         if not inmuebles_base:
+            logger.warning(f"[{self.source_name}] No se encontraron URLs para procesar.")
             return 0
 
         # --- FASE B: EXTRACCIÓN POR LOTES (MICRO-BATCHING) ---
@@ -40,23 +48,21 @@ class QuartoScraper:
         for i in range(0, len(inmuebles_base), tamaño_lote):
             lote_actual = inmuebles_base[i: i + tamaño_lote]
             num_lote = (i // tamaño_lote) + 1
-            print(f"[{self.source_name}] Procesando Lote {num_lote}/{total_lotes} ({len(lote_actual)} inmuebles)...")
+            logger.info(f"[{self.source_name}] ⏳ Procesando Lote {num_lote}/{total_lotes} ({len(lote_actual)} URLs)...")
 
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context()
+                browser = await p.chromium.launch(headless=False)
+                context = await browser.new_context(user_agent=self.user_agent)
                 semaforo = asyncio.Semaphore(3)
 
                 async def procesar_con_semaforo(item):
                     async with semaforo:
                         nueva_pestaña = await context.new_page()
 
-                        await optimizar_pagina(page_lista)
+                        # BUG CORREGIDO 1: Aplicamos optimización a la nueva_pestaña
+                        await optimizar_pagina(nueva_pestaña)
 
                         try:
-                            # Dependiendo del scraper, _extraer_detalle recibe diferentes parámetros.
-                            # Revisa cómo era en el original (ej: item.get("precio"), item.get("titulo"))
-                            # y ajústalo aquí si es necesario.
                             snapshot = await self._extraer_detalle(
                                 nueva_pestaña,
                                 item["url"],
@@ -65,7 +71,7 @@ class QuartoScraper:
                             )
                             return snapshot
                         except Exception as e:
-                            print(f"Error en {item.get('url')}: {e}")
+                            logger.error(f"[{self.source_name}] Error en {item.get('url')}: {e}")
                             return None
                         finally:
                             await nueva_pestaña.close()
@@ -82,9 +88,11 @@ class QuartoScraper:
                 await context.close()
                 await browser.close()
 
-            print(f"[{self.source_name}] Lote {num_lote} guardado en BD. RAM liberada. Descanso...")
+            logger.info(f"[{self.source_name}] ✅ Lote {num_lote} guardado en BD. RAM liberada. Descansando 3s...")
             await asyncio.sleep(3)  # Pausa entre lotes
 
+        logger.info(
+            f"[{self.source_name}] 🎉 Pipeline completado. {resultados_totales} inmuebles procesados exitosamente.")
         return resultados_totales
 
     async def _recolectar_urls(self, page: Page, base_search_url: str, max_pages: int = None):
@@ -97,9 +105,16 @@ class QuartoScraper:
             if max_pages and paginas_escaneadas >= max_pages:
                 break
 
+            logger.debug(f"[{self.source_name}] Escaneando página SPA: {current_url}")
             await page.goto(current_url, timeout=60000)
-            # Esperamos a que carguen las tarjetas de React
-            await page.wait_for_selector("div[status='active'][type='quarto']", timeout=15000)
+
+            try:
+                # Esperamos a que carguen las tarjetas de React
+                await page.wait_for_selector("div[status='active'][type='quarto']", timeout=15000)
+            except Exception:
+                logger.warning(
+                    f"[{self.source_name}] Timeout esperando tarjetas React en {current_url}. Puede ser la última página.")
+                break
 
             tarjetas = await page.locator("div[status='active'][type='quarto']").all()
 
@@ -114,7 +129,7 @@ class QuartoScraper:
                     precio_limpio = None
                     try:
                         # Extraemos el texto completo y buscamos el patrón de precio (ej. $350.00)
-                        texto_tarjeta = await tarjeta.inner_text()
+                        texto_tarjeta = await tarjeta.inner_text(timeout=2000)
                         match = re.search(r'\$\s*([\d\.,]+)', texto_tarjeta)
                         if match:
                             precio_str = match.group(1).replace(',', '')
@@ -126,25 +141,23 @@ class QuartoScraper:
                         urls_vistas.add(href)
                         inmuebles_encontrados.append({
                             "url": href,
-                            "precio": precio_limpio
+                            "precio": precio_limpio,
+                            "titulo": ""  # Quarto no lo hace fácil en el grid, lo sacaremos en la Fase B
                         })
 
             paginas_escaneadas += 1
 
-            # Paginación: Como no pasaste el HTML del botón, usamos una técnica genérica
-            # Si la URL tiene paginación por query params, la inyectamos manualmente
+            # Paginación: técnica genérica por query params
             if "&page=" in current_url:
                 current_page = int(re.search(r'&page=(\d+)', current_url).group(1))
                 current_url = re.sub(r'&page=\d+', f'&page={current_page + 1}', current_url)
             else:
                 current_url = f"{current_url}&page=2"
 
-            # Validamos si la siguiente página tiene resultados, sino rompemos
-            # (Esto se perfeccionará si Quarto usa un botón de "Siguiente" específico)
-
         return inmuebles_encontrados
 
-    async def _extraer_detalle(self, page: Page, url: str, precio_base: float):
+    # BUG CORREGIDO 2: Agregada la variable titulo_base que faltaba
+    async def _extraer_detalle(self, page: Page, url: str, precio_base: float, titulo_base: str):
         await page.goto(url, timeout=60000)
 
         # 1. Extraer ID de la URL (Quarto suele tener la URL como /propiedades/alquiler/12345)
@@ -155,7 +168,7 @@ class QuartoScraper:
         if precio_base: builder.set_price(precio_base, "USD")
 
         # 2. Título (h1)
-        titulo = ""
+        titulo = titulo_base
         try:
             titulo = await page.locator("h1").inner_text(timeout=5000)
         except Exception:
@@ -178,7 +191,7 @@ class QuartoScraper:
             municipio = partes[1].replace("Mun ", "").split("#")[0].strip() if len(partes) > 1 else "Caracas"
             builder.set_location(municipio=municipio, urbanismo=urbanismo)
 
-        # 5. Características Dinámicas (Iterando sobre los elementos del DOM)
+        # 5. Características Dinámicas
         try:
             caracteristicas = await page.locator("section:has(h2:has-text('Características')) p").all_inner_texts()
             amenidades_validas = []
@@ -200,7 +213,6 @@ class QuartoScraper:
                         bano_val = float(re.search(r'\d+', valor).group()) if re.search(r'\d+', valor) else None
                         builder.add_features(banos=bano_val)
                     else:
-                        # Si es un extra (Piscina, Gimnasio, etc) y dice "Si", lo agregamos
                         if valor == "si":
                             amenidades_validas.append(partes[0].strip())
 

@@ -3,33 +3,40 @@ import re
 from playwright.async_api import async_playwright, Page
 from scraper.builder import PropertySnapshotBuilder
 from scraper.utils import optimizar_pagina
+import logging
+
+# Instanciamos el logger
+logger = logging.getLogger(__name__)
 
 class MercadolibreScraper:
     def __init__(self):
         self.source_name = "mercadolibre"
         self.base_url = "https://listado.mercadolibre.com.ve"
+        # Disfrazamos a nuestro bot con un User-Agent estándar de Mac
+        self.user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
     async def run_pipeline(self, start_url: str, max_pages: int = None, save_callback=None):
         resultados_totales = 0
 
         # --- FASE A: RECOLECCIÓN DE URLs ---
         async with async_playwright() as p:
-            # NOTA: En mercadolibre y quarto, recuerda usar headless=False y el user_agent aquí si lo configuraste
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context()
+            # ¡CRÍTICO PARA MERCADO LIBRE! headless=False para evadir el WAF
+            browser = await p.chromium.launch(headless=False)
+            context = await browser.new_context(user_agent=self.user_agent)
             page_lista = await context.new_page()
 
             await optimizar_pagina(page_lista)
 
-            print(f"[{self.source_name}] Fase A: Recolección de URLs...")
+            logger.info(f"[{self.source_name}] Fase A: Recolección de URLs iniciada (Modo Visible)...")
             inmuebles_base = await self._recolectar_urls(page_lista, start_url, max_pages)
 
             await page_lista.close()
             await context.close()
             await browser.close()
-            print(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
+            logger.info(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
 
         if not inmuebles_base:
+            logger.warning(f"[{self.source_name}] No se encontraron URLs. (Posible bloqueo de CAPTCHA)")
             return 0
 
         # --- FASE B: EXTRACCIÓN POR LOTES (MICRO-BATCHING) ---
@@ -39,23 +46,22 @@ class MercadolibreScraper:
         for i in range(0, len(inmuebles_base), tamaño_lote):
             lote_actual = inmuebles_base[i: i + tamaño_lote]
             num_lote = (i // tamaño_lote) + 1
-            print(f"[{self.source_name}] Procesando Lote {num_lote}/{total_lotes} ({len(lote_actual)} inmuebles)...")
+            logger.info(f"[{self.source_name}] ⏳ Procesando Lote {num_lote}/{total_lotes} ({len(lote_actual)} URLs)...")
 
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context()
+                # Nuevamente headless=False para que no nos bloqueen al visitar el detalle
+                browser = await p.chromium.launch(headless=False)
+                context = await browser.new_context(user_agent=self.user_agent)
                 semaforo = asyncio.Semaphore(3)
 
                 async def procesar_con_semaforo(item):
                     async with semaforo:
                         nueva_pestaña = await context.new_page()
 
-                        await optimizar_pagina(page_lista)
+                        # BUG CORREGIDO: Aplicamos optimización a nueva_pestaña
+                        await optimizar_pagina(nueva_pestaña)
 
                         try:
-                            # Dependiendo del scraper, _extraer_detalle recibe diferentes parámetros.
-                            # Revisa cómo era en el original (ej: item.get("precio"), item.get("titulo"))
-                            # y ajústalo aquí si es necesario.
                             snapshot = await self._extraer_detalle(
                                 nueva_pestaña,
                                 item["url"],
@@ -64,7 +70,7 @@ class MercadolibreScraper:
                             )
                             return snapshot
                         except Exception as e:
-                            print(f"Error en {item.get('url')}: {e}")
+                            logger.error(f"[{self.source_name}] Error en {item.get('url')}: {e}")
                             return None
                         finally:
                             await nueva_pestaña.close()
@@ -81,9 +87,10 @@ class MercadolibreScraper:
                 await context.close()
                 await browser.close()
 
-            print(f"[{self.source_name}] Lote {num_lote} guardado en BD. RAM liberada. Descanso...")
+            logger.info(f"[{self.source_name}] ✅ Lote {num_lote} guardado en BD. RAM liberada. Descansando 3s...")
             await asyncio.sleep(3)  # Pausa entre lotes
 
+        logger.info(f"[{self.source_name}] 🎉 Pipeline completado. {resultados_totales} inmuebles procesados exitosamente.")
         return resultados_totales
 
     async def _recolectar_urls(self, page: Page, base_search_url: str, max_pages: int = None):
@@ -96,6 +103,7 @@ class MercadolibreScraper:
             if max_pages and paginas_escaneadas >= max_pages:
                 break
 
+            logger.debug(f"[{self.source_name}] Escaneando página: {current_url}")
             await page.goto(current_url, timeout=60000)
 
             # Selector de los items de la lista
@@ -105,7 +113,11 @@ class MercadolibreScraper:
                 enlace_loc = tarjeta.locator("h3.poly-component__title-wrapper a").first
                 if await enlace_loc.count() > 0:
                     href = await enlace_loc.get_attribute("href")
-                    titulo = await enlace_loc.inner_text(timeout=2000)
+                    # Mercado Libre puede ser lento cargando títulos, bajamos el timeout o lo envolvemos en try
+                    try:
+                        titulo = await enlace_loc.inner_text(timeout=2000)
+                    except Exception:
+                        titulo = "Sin título"
 
                     precio_limpio = None
                     try:

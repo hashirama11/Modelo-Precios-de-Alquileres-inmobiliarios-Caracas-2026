@@ -4,6 +4,10 @@ from urllib.parse import urljoin
 from playwright.async_api import async_playwright, Page
 from scraper.builder import PropertySnapshotBuilder
 from scraper.utils import optimizar_pagina
+import logging
+
+# Instanciamos el logger
+logger = logging.getLogger(__name__)
 
 class VecindaryScraper:
     def __init__(self):
@@ -15,22 +19,22 @@ class VecindaryScraper:
 
         # --- FASE A: RECOLECCIÓN DE URLs ---
         async with async_playwright() as p:
-            # NOTA: En mercadolibre y quarto, recuerda usar headless=False y el user_agent aquí si lo configuraste
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context()
             page_lista = await context.new_page()
 
             await optimizar_pagina(page_lista)
 
-            print(f"[{self.source_name}] Fase A: Recolección de URLs...")
+            logger.info(f"[{self.source_name}] Fase A: Recolección de URLs iniciada...")
             inmuebles_base = await self._recolectar_urls(page_lista, start_url, max_pages)
 
             await page_lista.close()
             await context.close()
             await browser.close()
-            print(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
+            logger.info(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
 
         if not inmuebles_base:
+            logger.warning(f"[{self.source_name}] No se encontraron URLs para procesar.")
             return 0
 
         # --- FASE B: EXTRACCIÓN POR LOTES (MICRO-BATCHING) ---
@@ -40,7 +44,7 @@ class VecindaryScraper:
         for i in range(0, len(inmuebles_base), tamaño_lote):
             lote_actual = inmuebles_base[i: i + tamaño_lote]
             num_lote = (i // tamaño_lote) + 1
-            print(f"[{self.source_name}] Procesando Lote {num_lote}/{total_lotes} ({len(lote_actual)} inmuebles)...")
+            logger.info(f"[{self.source_name}] ⏳ Procesando Lote {num_lote}/{total_lotes} ({len(lote_actual)} URLs)...")
 
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
@@ -51,12 +55,10 @@ class VecindaryScraper:
                     async with semaforo:
                         nueva_pestaña = await context.new_page()
 
-                        await optimizar_pagina(page_lista)
+                        # BUG CORREGIDO: Aplicamos optimización a la nueva pestaña
+                        await optimizar_pagina(nueva_pestaña)
 
                         try:
-                            # Dependiendo del scraper, _extraer_detalle recibe diferentes parámetros.
-                            # Revisa cómo era en el original (ej: item.get("precio"), item.get("titulo"))
-                            # y ajústalo aquí si es necesario.
                             snapshot = await self._extraer_detalle(
                                 nueva_pestaña,
                                 item["url"],
@@ -65,7 +67,7 @@ class VecindaryScraper:
                             )
                             return snapshot
                         except Exception as e:
-                            print(f"Error en {item.get('url')}: {e}")
+                            logger.error(f"[{self.source_name}] Error en {item.get('url')}: {e}")
                             return None
                         finally:
                             await nueva_pestaña.close()
@@ -82,9 +84,10 @@ class VecindaryScraper:
                 await context.close()
                 await browser.close()
 
-            print(f"[{self.source_name}] Lote {num_lote} guardado en BD. RAM liberada. Descanso...")
-            await asyncio.sleep(3)  # Pausa entre lotes
+            logger.info(f"[{self.source_name}] ✅ Lote {num_lote} guardado en BD. RAM liberada. Descansando 3s...")
+            await asyncio.sleep(3)
 
+        logger.info(f"[{self.source_name}] 🎉 Pipeline completado. {resultados_totales} inmuebles procesados.")
         return resultados_totales
 
     async def _recolectar_urls(self, page: Page, base_search_url: str, max_pages: int = None):
@@ -97,6 +100,7 @@ class VecindaryScraper:
             if max_pages and paginas_escaneadas >= max_pages:
                 break
 
+            logger.debug(f"[{self.source_name}] Escaneando página: {current_url}")
             await page.goto(current_url, timeout=60000)
 
             # Las tarjetas de Vecindary son enlaces (a) que apuntan a "/clasificado/..."
@@ -111,7 +115,6 @@ class VecindaryScraper:
                 precio_limpio = None
 
                 try:
-                    # Extraemos todo el texto de la tarjeta y buscamos patrones
                     texto_tarjeta = await tarjeta.inner_text(timeout=2000)
                     lineas = [linea.strip() for linea in texto_tarjeta.split('\n') if linea.strip()]
 
@@ -120,7 +123,7 @@ class VecindaryScraper:
                             precio_str = re.sub(r'[^\d]', '', linea)
                             if precio_str:
                                 precio_limpio = float(precio_str)
-                        elif not titulo and len(linea) > 15:  # Asumimos que la primera línea larga es el título
+                        elif not titulo and len(linea) > 15:
                             titulo = linea
                 except Exception:
                     pass
@@ -135,7 +138,6 @@ class VecindaryScraper:
 
             paginas_escaneadas += 1
 
-            # Paginación (Buscamos enlaces que terminen en "/pagina-X")
             next_page_num = paginas_escaneadas + 1
             siguiente_btn = page.locator(f"a[href$='/pagina-{next_page_num}']")
 
@@ -150,7 +152,6 @@ class VecindaryScraper:
     async def _extraer_detalle(self, page: Page, url: str, precio_base: float, titulo_base: str):
         await page.goto(url, timeout=60000)
 
-        # 1. Extraer ID de la URL (Vecindary pone el ID al final: ...-showroom-9756)
         match_id = re.search(r'-(\d+)$', url)
         external_id = match_id.group(1) if match_id else url.split("/")[-1]
 
@@ -158,23 +159,19 @@ class VecindaryScraper:
 
         if precio_base: builder.set_price(precio_base, "USD")
 
-        # 2. Título (h1)
         try:
             titulo = await page.locator("h1").inner_text(timeout=3000)
             builder.set_general_info(titulo=titulo, descripcion=None)
         except Exception:
             builder.set_general_info(titulo=titulo_base, descripcion=None)
 
-        # 3. Ubicación (Suele estar en un h2 con la clase font-normal, ej: Centro Comercial Palo Verde...)
         try:
-            # Buscamos un texto que contenga Caracas dentro de un h2
             ubicacion_text = await page.locator("h2:has-text('Caracas')").first.inner_text(timeout=3000)
             partes = [p.strip() for p in ubicacion_text.split(",")]
 
             municipio = "Caracas"
             urbanismo = partes[0] if partes else ""
 
-            # Intentamos ubicar el municipio real si está listado
             for p in partes:
                 if p in ["Sucre", "Baruta", "Chacao", "El Hatillo", "Libertador"]:
                     municipio = p
@@ -183,9 +180,7 @@ class VecindaryScraper:
         except Exception:
             pass
 
-        # 4. Características Principales (m2, baños)
         try:
-            # Buscamos todos los h2 que tengan span dentro o números
             h2_elementos = await page.locator("h2").all_inner_texts()
             for texto in h2_elementos:
                 texto_limpio = texto.lower()
@@ -202,9 +197,7 @@ class VecindaryScraper:
         except Exception:
             pass
 
-        # 5. Amenidades Extras (En la sección Detalles adicionales del inmueble)
         try:
-            # Extraemos todos los p dentro de listas ul > li.list-disc
             extras_lista = await page.locator("li.list-disc p").all_inner_texts()
             if extras_lista:
                 builder.add_extra_data("amenidades", [e.strip() for e in extras_lista])

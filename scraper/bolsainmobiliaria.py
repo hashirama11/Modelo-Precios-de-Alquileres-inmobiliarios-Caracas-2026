@@ -3,6 +3,10 @@ import re
 from playwright.async_api import async_playwright, Page
 from scraper.builder import PropertySnapshotBuilder
 from scraper.utils import optimizar_pagina
+import logging
+
+# Instanciamos el logger
+logger = logging.getLogger(__name__)
 
 class BolsaInmobiliariaScraper:
     def __init__(self):
@@ -14,22 +18,23 @@ class BolsaInmobiliariaScraper:
 
         # --- FASE A: RECOLECCIÓN DE URLs ---
         async with async_playwright() as p:
-            # NOTA: En mercadolibre y quarto, recuerda usar headless=False y el user_agent aquí si lo configuraste
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context()
             page_lista = await context.new_page()
 
+            # Optimizamos la página de la lista
             await optimizar_pagina(page_lista)
 
-            print(f"[{self.source_name}] Fase A: Recolección de URLs...")
+            logger.info(f"[{self.source_name}] Fase A: Recolección de URLs iniciada...")
             inmuebles_base = await self._recolectar_urls(page_lista, start_url, max_pages)
 
             await page_lista.close()
             await context.close()
             await browser.close()
-            print(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
+            logger.info(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
 
         if not inmuebles_base:
+            logger.warning(f"[{self.source_name}] No se encontraron URLs para procesar.")
             return 0
 
         # --- FASE B: EXTRACCIÓN POR LOTES (MICRO-BATCHING) ---
@@ -39,7 +44,7 @@ class BolsaInmobiliariaScraper:
         for i in range(0, len(inmuebles_base), tamaño_lote):
             lote_actual = inmuebles_base[i: i + tamaño_lote]
             num_lote = (i // tamaño_lote) + 1
-            print(f"[{self.source_name}] Procesando Lote {num_lote}/{total_lotes} ({len(lote_actual)} inmuebles)...")
+            logger.info(f"[{self.source_name}] ⏳ Procesando Lote {num_lote}/{total_lotes} ({len(lote_actual)} URLs)...")
 
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
@@ -50,12 +55,10 @@ class BolsaInmobiliariaScraper:
                     async with semaforo:
                         nueva_pestaña = await context.new_page()
 
-                        await optimizar_pagina(page_lista)
+                        # ¡CORRECCIÓN AQUÍ! Aplicamos la optimización a la nueva_pestaña, NO a page_lista
+                        await optimizar_pagina(nueva_pestaña)
 
                         try:
-                            # Dependiendo del scraper, _extraer_detalle recibe diferentes parámetros.
-                            # Revisa cómo era en el original (ej: item.get("precio"), item.get("titulo"))
-                            # y ajústalo aquí si es necesario.
                             snapshot = await self._extraer_detalle(
                                 nueva_pestaña,
                                 item["url"],
@@ -64,7 +67,7 @@ class BolsaInmobiliariaScraper:
                             )
                             return snapshot
                         except Exception as e:
-                            print(f"Error en {item.get('url')}: {e}")
+                            logger.error(f"[{self.source_name}] Error en {item.get('url')}: {e}")
                             return None
                         finally:
                             await nueva_pestaña.close()
@@ -81,9 +84,10 @@ class BolsaInmobiliariaScraper:
                 await context.close()
                 await browser.close()
 
-            print(f"[{self.source_name}] Lote {num_lote} guardado en BD. RAM liberada. Descanso...")
+            logger.info(f"[{self.source_name}] ✅ Lote {num_lote} guardado en BD. RAM liberada. Descansando 3s...")
             await asyncio.sleep(3)  # Pausa entre lotes
 
+        logger.info(f"[{self.source_name}] 🎉 Pipeline completado. {resultados_totales} inmuebles procesados exitosamente.")
         return resultados_totales
 
     async def _recolectar_urls(self, page: Page, base_search_url: str, max_pages: int = None):
@@ -96,6 +100,7 @@ class BolsaInmobiliariaScraper:
             if max_pages and paginas_escaneadas >= max_pages:
                 break
 
+            logger.debug(f"[{self.source_name}] Escaneando página: {current_url}")
             await page.goto(current_url, timeout=60000)
             tarjetas = await page.locator("div.item").all()
 
@@ -108,7 +113,6 @@ class BolsaInmobiliariaScraper:
                     precio_limpio = None
                     try:
                         precio_text = await tarjeta.locator("div.areaPrecio p.precio").inner_text(timeout=2000)
-                        # Removemos todo excepto números y puntos (ej. "US$30,000" -> 30000)
                         precio_str = re.sub(r'[^\d]', '', precio_text.replace(',', ''))
                         if precio_str:
                             precio_limpio = float(precio_str)
@@ -135,6 +139,7 @@ class BolsaInmobiliariaScraper:
         return inmuebles_encontrados
 
     async def _extraer_detalle(self, page: Page, url: str, precio_base: float, titulo_base: str):
+        # Mantenemos el timeout alto por si la página es lenta, pero sin imágenes cargará rápido
         await page.goto(url, timeout=60000)
 
         # 1. Extraer ID
@@ -142,7 +147,6 @@ class BolsaInmobiliariaScraper:
             codigo_text = await page.locator("li:has(strong:has-text('Código:'))").inner_text(timeout=5000)
             external_id = codigo_text.replace("Código:", "").strip()
         except Exception:
-            # Plan B: Sacar ID de la URL si el texto falla
             external_id = url.split("/")[-1]
 
         builder = PropertySnapshotBuilder(source_name=self.source_name, external_id=external_id, url=url)
@@ -151,22 +155,18 @@ class BolsaInmobiliariaScraper:
 
         # 2. Descripción completa y Extras (amenidades)
         try:
-            # Toda la descripción
             descripcion_raw = await page.locator("div.content").inner_text(timeout=3000)
             builder.set_general_info(titulo=titulo_base, descripcion=descripcion_raw.strip())
 
-            # Sacar extras de los tags <li> dentro de la descripción (ej: Ascensores, Internet)
             extras_lista = await page.locator("div.content ul li").all_inner_texts()
             if extras_lista:
                 builder.add_extra_data("amenidades", [e.strip(" .") for e in extras_lista])
         except Exception:
-            # Si falla la descripción, al menos ponemos el título
             builder.set_general_info(titulo=titulo_base, descripcion=None)
 
         # 3. Ubicación
         try:
             ciudad = await page.locator("li:has(strong:has-text('Ciudad:'))").inner_text(timeout=3000)
-            # Para urbanización, podríamos usar el título "Pent House en venta - Guatire, Calle Zamora"
             partes_titulo = titulo_base.split("-")
             urbanismo = partes_titulo[-1].strip() if len(partes_titulo) > 1 else ""
 

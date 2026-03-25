@@ -1,8 +1,6 @@
 import asyncio
 import logging
 import sys
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 from scraper.remax import RemaxScraper
 from db.database import engine, AsyncSessionLocal
 from sqlalchemy.future import select
@@ -223,47 +221,50 @@ async def job_mercadolibre_caracas():
         logger.error(f"Error durante la ejecución del job Mercado Libre: {e}")
 
 
+# Configuramos un log hermoso, detallado y con la hora exacta
+logging.basicConfig(
+    level=logging.DEBUG,  # <--- ¡LA MAGIA ESTÁ AQUÍ! Cambiamos de INFO a DEBUG
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Silenciamos librerías de terceros (como Playwright o SQLite) para que no hagan "ruido basura"
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+logging.getLogger("playwright").setLevel(logging.WARNING)
+
+
 async def main():
+    # 1. Preparamos la base de datos
     await init_db()
 
-    # Configuramos el planificador semanal
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(job_mls_caracas, CronTrigger(day_of_week='sun', hour=2, minute=0))
-    scheduler.add_job(job_rentahouse_caracas, CronTrigger(day_of_week='sun', hour=3, minute=0))
-    scheduler.add_job(job_remax_caracas, CronTrigger(day_of_week='sun', hour=4, minute=0))
-    scheduler.add_job(job_bolsainmobiliaria_caracas, CronTrigger(day_of_week='sun', hour=5, minute=0))
-    scheduler.add_job(job_quarto_caracas, CronTrigger(day_of_week='sun', hour=6, minute=0))
-    scheduler.add_job(job_vecindary_caracas, CronTrigger(day_of_week='sun', hour=7, minute=0))
-    scheduler.add_job(job_turesidencia_caracas, CronTrigger(day_of_week='sun', hour=8, minute=0))
-    scheduler.add_job(job_mercadolibre_caracas, CronTrigger(day_of_week='sun', hour=9, minute=0))
+    logger.info("==================================================")
+    logger.info("🚀 INICIANDO PIPELINE DE EXTRACCIÓN INMOBILIARIA")
+    logger.info("==================================================")
 
-    scheduler.start()
+    # 2. Ejecución Secuencial (Una fuente a la vez)
+    # Comenta con '#' las fuentes que NO quieras ejecutar en esta corrida.
 
-    # =================================================================
-    # EL INTERRUPTOR: Solo entra aquí si escribimos "--seed" en la terminal
-    # =================================================================
-    if "--seed" in sys.argv:
-        logger.info("INICIANDO CARGA MASIVA INICIAL (--seed detectado)... Esto tomará horas.")
+    await job_mls_caracas()
+    await job_rentahouse_caracas()
+    await job_remax_caracas()
+    await job_bolsainmobiliaria_caracas()
+    await job_quarto_caracas()
+    await job_vecindary_caracas()
+    await job_turesidencia_caracas()
 
-        # await job_mls_caracas()
-        await job_rentahouse_caracas()
-        await job_remax_caracas()
-        await job_bolsainmobiliaria_caracas()
-        await job_quarto_caracas()
-        await job_vecindary_caracas()
-        await job_turesidencia_caracas()
-        # await job_mercadolibre_caracas()
-
-        logger.info("¡CARGA MASIVA FINALIZADA EXITOSAMENTE! El worker entra en modo reposo.")
-    else:
-        logger.info("Worker iniciado en MODO PRODUCCIÓN (Normal). Ejecución programada para los domingos.")
-
-    # Mantenemos el proceso vivo en background
     try:
-        while True:
-            await asyncio.sleep(3600)
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Apagando worker...")
+        await job_mercadolibre_caracas()
+    except Exception as e:
+        logger.error(f"❌ Falló Mercado Libre, saltando a la siguiente: {e}")
+
+    # 3. Apagado automático
+    logger.info("==================================================")
+    logger.info("✅ PIPELINE FINALIZADO EXITOSAMENTE. Apagando sistema.")
+    logger.info("==================================================")
 
 
 if __name__ == "__main__":
