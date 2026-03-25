@@ -238,34 +238,29 @@ logging.getLogger("playwright").setLevel(logging.WARNING)
 
 
 async def main():
-    # 1. Preparamos la base de datos
     await init_db()
+    logger.info("🚀 PIPELINE INICIADO")
 
-    logger.info("==================================================")
-    logger.info("🚀 INICIANDO PIPELINE DE EXTRACCIÓN INMOBILIARIA")
-    logger.info("==================================================")
+    # Lista de fuentes para iterar
+    fuentes = [
+        ("MLS", job_mls_caracas),
+        ("Rent-A-House", job_rentahouse_caracas),
+        ("REMAX", job_remax_caracas),
+        ("Bolsa Inmobiliaria", job_bolsainmobiliaria_caracas),
+        ("Quarto", job_quarto_caracas),
+        ("Vecindary", job_vecindary_caracas),
+        ("Tu Residencia", job_turesidencia_caracas),
+        ("Mercado Libre", job_mercadolibre_caracas),
+    ]
 
-    # 2. Ejecución Secuencial (Una fuente a la vez)
-    # Comenta con '#' las fuentes que NO quieras ejecutar en esta corrida.
+    for nombre, job in fuentes:
+        try:
+            logger.info(f"--- Procesando fuente: {nombre} ---")
+            await job()
+        except Exception as e:
+            logger.error(f"❌ Error crítico en {nombre}: {e}. Saltando a la siguiente fuente...")
 
-    await job_mls_caracas()
-    await job_rentahouse_caracas()
-    await job_remax_caracas()
-    await job_bolsainmobiliaria_caracas()
-    await job_quarto_caracas()
-    await job_vecindary_caracas()
-    await job_turesidencia_caracas()
-
-    try:
-        await job_mercadolibre_caracas()
-    except Exception as e:
-        logger.error(f"❌ Falló Mercado Libre, saltando a la siguiente: {e}")
-
-    # 3. Apagado automático
-    logger.info("==================================================")
-    logger.info("✅ PIPELINE FINALIZADO EXITOSAMENTE. Apagando sistema.")
-    logger.info("==================================================")
-
+    logger.info("✅ PIPELINE FINALIZADO")
 
 if __name__ == "__main__":
     # Inicia el bucle de eventos asíncrono

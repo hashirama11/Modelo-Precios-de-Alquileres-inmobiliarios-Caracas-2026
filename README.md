@@ -1,6 +1,28 @@
 # Proyecto de Ciencia de Datos
 ## Precio Alquileres Caracas 2026
 
+AlquilerCaracas/
+│
+├── db/                     # Tu capa de persistencia base (modelos SQLAlchemy y conexión)
+├── scraper/                # La maquinaria de extracción (Playwright)
+├── worker.py               # 🔘 INTERRUPTOR 1: Comando para iniciar el Scraping
+│
+├── core/                   # 🧠 EL CEREBRO: Donde ocurre la magia
+│   ├── cleaning/           # Scripts para limpiar datos (Tratar JSON, nulos, outliers)
+│   └── ml/                 # Scripts para entrenar y guardar modelos de Machine Learning
+├── pipeline.py             # 🔘 INTERRUPTOR 2: Lee inmuebles.db, limpia, entrena y crea clean.db
+│
+├── api/                    # 🔌 LA TOMA DE CORRIENTE: endpoints separados
+│   └── routes.py           # Aquí defines tus @app.get()
+├── main.py                 # 🔘 INTERRUPTOR 3: Comando para encender FastAPI (Solo inicializa)
+│
+├── dashboard/              # 🎨 EL ESCAPARATE: Cosas exclusivas de Streamlit (imágenes, css)
+│   └── views.py            # Componentes visuales separados si crece mucho
+└── app.py                  # 🔘 INTERRUPTOR 4: Comando para encender Streamlit
+│
+├── inmuebles.db            # (Datos Crudos / Capa Bronce) -> Generado por worker.py
+└── inmuebles_clean.db      # (Datos Limpios / Capa Oro) -> Generado por pipeline.py
+
 El modelo aprenderá que, por ejemplo, Chacao tiene un coeficiente de precio base mayor que Libertador, pero que los metros cuadrados ($m^2$) tienen un impacto constante.
 $$Precio_{predicho} = \beta_0 + \beta_1(m^2) + \beta_2(habitaciones) + \beta_3(zona\_score)$$
 
