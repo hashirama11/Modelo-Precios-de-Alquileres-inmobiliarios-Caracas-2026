@@ -179,7 +179,8 @@ async def job_bolsainmobiliaria_caracas():
 
 async def job_quarto_caracas():
     logger.info("Iniciando Job: QuartoScraper")
-    start_url = "https://quartoapp.com/propiedades/alquiler?type_id=1&category_id=&price_min=100&price_max=&city_id=1&municipality_id=1%2C2%2C3%2C4%2C5&urbanization_id=1%2C2%2C3%2C4%2C5%2C6%2C7%2C8%2C9%2C10%2C11%2C12%2C13%2C14%2C15%2C16%2C17%2C18%2C19%2C20%2C21%2C22%2C23%2C24%2C25%2C26%2C27%2C28%2C29%2C30%2C31%2C32%2C33%2C34%2C35%2C36%2C37%2C38%2C39%2C40%2C41%2C42%2C43%2C44%2C45%2C46%2C47%2C48%2C49%2C50%2C51%2C52%2C53%2C54%2C55%2C56%2C57%2C58%2C59%2C60%2C61%2C62%2C63%2C64%2C65%2C66%2C67%2C68%2C69%2C70%2C71%2C72%2C73%2C74%2C75%2C76%2C77%2C78%2C79%2C80%2C81%2C82%2C83%2C84%2C85%2C86%2C87%2C88%2C89%2C90%2C91%2C92%2C93%2C94%2C95%2C96%2C97%2C98%2C99%2C100%2C101%2C102%2C103%2C104%2C105%2C106%2C107%2C108%2C109%2C110%2C111"
+    # URL limpia: Alquiler (type_id=1) en Caracas/Miranda (city_id=1 y municipios principales)
+    start_url = "https://quartoapp.com/propiedades/alquiler?type_id=1&city_id=1&municipality_id=1%2C2%2C3%2C4%2C5"
     scraper = QuartoScraper()
     try:
         total_guardados = await scraper.run_pipeline(start_url, save_callback=procesar_y_guardar)
@@ -211,14 +212,35 @@ async def job_turesidencia_caracas():
 
 
 async def job_mercadolibre_caracas():
-    logger.info("Iniciando Job: MercadolibreScraper")
-    start_url = "https://listado.mercadolibre.com.ve/inmuebles/distrito-capital/alquiler_NoIndex_True#applied_filter_id%3Dstate%26applied_filter_name%3DUbicaci%C3%B3n%26applied_filter_order%3D5%26applied_value_id%3DTUxWUERJU2wxMzkxMA%26applied_value_name%3DDistrito+Capital%26applied_value_order%3D8%26applied_value_results%3D30500%26is_custom%3Dfalse"
+    logger.info("Iniciando Job: MercadolibreScraper (Por Municipios)")
+
+    # Dividimos la búsqueda para evadir el límite máximo de páginas de Mercado Libre
+    urls_mercadolibre = [
+        "https://listado.mercadolibre.com.ve/inmuebles/apartamentos/alquiler/distrito-capital/chacao/",
+        "https://listado.mercadolibre.com.ve/inmuebles/apartamentos/alquiler/distrito-capital/baruta/",
+        "https://listado.mercadolibre.com.ve/inmuebles/apartamentos/alquiler/distrito-capital/sucre/",
+        "https://listado.mercadolibre.com.ve/inmuebles/apartamentos/alquiler/distrito-capital/libertador/",
+        "https://listado.mercadolibre.com.ve/inmuebles/apartamentos/alquiler/distrito-capital/el-hatillo/"
+    ]
+
     scraper = MercadolibreScraper()
+    total_guardados_general = 0
+
     try:
-        total_guardados = await scraper.run_pipeline(start_url, save_callback=procesar_y_guardar)
-        logger.info(f"Scraping Mercado Libre completado. {total_guardados} inmuebles guardados.")
+        for url in urls_mercadolibre:
+            logger.info(f"🔍 Explorando zona Mercado Libre: {url.split('/')[-2].upper()}")
+            try:
+                # No le pasamos max_pages para que corra hasta el final de esa zona
+                guardados_zona = await scraper.run_pipeline(url, save_callback=procesar_y_guardar)
+                total_guardados_general += guardados_zona
+                await asyncio.sleep(5)  # Descanso entre zonas
+            except Exception as e:
+                logger.error(f"⚠️ Error en zona ML {url}: {e}. Continuando...")
+                continue
+
+        logger.info(f"✅ Scraping Mercado Libre completado. {total_guardados_general} inmuebles guardados en total.")
     except Exception as e:
-        logger.error(f"Error durante la ejecución del job Mercado Libre: {e}")
+        logger.error(f"Error crítico durante la ejecución del job Mercado Libre: {e}")
 
 
 # Configuramos un log hermoso, detallado y con la hora exacta
@@ -243,14 +265,14 @@ async def main():
 
     # Lista de fuentes para iterar
     fuentes = [
-        ("MLS", job_mls_caracas),
-        ("Rent-A-House", job_rentahouse_caracas),
-        ("REMAX", job_remax_caracas),
-        ("Bolsa Inmobiliaria", job_bolsainmobiliaria_caracas),
+        #("MLS", job_mls_caracas),
+        #("Rent-A-House", job_rentahouse_caracas),
+        #("REMAX", job_remax_caracas),
+        #("Bolsa Inmobiliaria", job_bolsainmobiliaria_caracas),
         ("Quarto", job_quarto_caracas),
-        ("Vecindary", job_vecindary_caracas),
-        ("Tu Residencia", job_turesidencia_caracas),
-        ("Mercado Libre", job_mercadolibre_caracas),
+        #("Vecindary", job_vecindary_caracas),
+        #("Tu Residencia", job_turesidencia_caracas),
+        #("Mercado Libre", job_mercadolibre_caracas),
     ]
 
     for nombre, job in fuentes:

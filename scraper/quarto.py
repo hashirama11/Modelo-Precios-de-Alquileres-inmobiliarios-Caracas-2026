@@ -6,7 +6,6 @@ from scraper.builder import PropertySnapshotBuilder
 from scraper.utils import optimizar_pagina
 import logging
 
-# Instanciamos el logger
 logger = logging.getLogger(__name__)
 
 
@@ -14,41 +13,35 @@ class QuartoScraper:
     def __init__(self):
         self.source_name = "quarto"
         self.base_url = "https://quartoapp.com"
-        # Disfrazamos a nuestro bot con un User-Agent estándar de Mac
         self.user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
     async def run_pipeline(self, start_url: str, max_pages: int = None, save_callback=None):
         resultados_totales = 0
 
-        # --- FASE A: RECOLECCIÓN DE URLs ---
         async with async_playwright() as p:
-            # QUARTO: Usamos headless=False y User-Agent porque al ser React/SPA suelen bloquear bots invisibles
             browser = await p.chromium.launch(headless=False)
             context = await browser.new_context(user_agent=self.user_agent)
             page_lista = await context.new_page()
 
             await optimizar_pagina(page_lista)
-
-            logger.info(f"[{self.source_name}] Fase A: Recolección de URLs iniciada (Modo Visible SPA)...")
+            logger.info(f"[{self.source_name}] Fase A: Recolección de URLs (SPA Mode)...")
             inmuebles_base = await self._recolectar_urls(page_lista, start_url, max_pages)
 
             await page_lista.close()
             await context.close()
             await browser.close()
-            logger.info(f"[{self.source_name}] Fase A terminada. {len(inmuebles_base)} URLs encontradas.")
 
         if not inmuebles_base:
-            logger.warning(f"[{self.source_name}] No se encontraron URLs para procesar.")
+            logger.warning(f"[{self.source_name}] 0 URLs. Revisa si el sitio cambió su enrutamiento.")
             return 0
 
-        # --- FASE B: EXTRACCIÓN POR LOTES (MICRO-BATCHING) ---
-        tamaño_lote = 100
+        tamaño_lote = 50
         total_lotes = (len(inmuebles_base) // tamaño_lote) + 1
 
         for i in range(0, len(inmuebles_base), tamaño_lote):
             lote_actual = inmuebles_base[i: i + tamaño_lote]
             num_lote = (i // tamaño_lote) + 1
-            logger.info(f"[{self.source_name}] ⏳ Procesando Lote {num_lote}/{total_lotes} ({len(lote_actual)} URLs)...")
+            logger.info(f"[{self.source_name}] ⏳ Procesando Lote {num_lote}/{total_lotes}...")
 
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=False)
@@ -58,16 +51,10 @@ class QuartoScraper:
                 async def procesar_con_semaforo(item):
                     async with semaforo:
                         nueva_pestaña = await context.new_page()
-
-                        # BUG CORREGIDO 1: Aplicamos optimización a la nueva_pestaña
                         await optimizar_pagina(nueva_pestaña)
-
                         try:
                             snapshot = await self._extraer_detalle(
-                                nueva_pestaña,
-                                item["url"],
-                                item.get("precio", None),
-                                item.get("titulo", "")
+                                nueva_pestaña, item["url"], item.get("precio"), item.get("titulo")
                             )
                             return snapshot
                         except Exception as e:
@@ -80,7 +67,6 @@ class QuartoScraper:
                 resultados_crudos = await asyncio.gather(*tareas)
                 resultados_validos = [r for r in resultados_crudos if r is not None]
 
-                # ¡GUARDADO INMEDIATO EN LA BD!
                 if save_callback and resultados_validos:
                     await save_callback(resultados_validos)
                     resultados_totales += len(resultados_validos)
@@ -88,137 +74,144 @@ class QuartoScraper:
                 await context.close()
                 await browser.close()
 
-            logger.info(f"[{self.source_name}] ✅ Lote {num_lote} guardado en BD. RAM liberada. Descansando 3s...")
-            await asyncio.sleep(3)  # Pausa entre lotes
+            await asyncio.sleep(2)
 
-        logger.info(
-            f"[{self.source_name}] 🎉 Pipeline completado. {resultados_totales} inmuebles procesados exitosamente.")
         return resultados_totales
 
     async def _recolectar_urls(self, page: Page, base_search_url: str, max_pages: int = None):
         inmuebles_encontrados = []
         urls_vistas = set()
-        current_url = base_search_url
         paginas_escaneadas = 0
 
-        while current_url:
+        logger.info(f"[{self.source_name}] Cargando SPA React (Carga Inicial Única)...")
+        # ¡IMPORTANTE! Solo cargamos la URL una vez fuera del bucle
+        await page.goto(base_search_url, timeout=60000)
+
+        while True:
             if max_pages and paginas_escaneadas >= max_pages:
                 break
 
-            logger.debug(f"[{self.source_name}] Escaneando página SPA: {current_url}")
-            await page.goto(current_url, timeout=60000)
+            logger.debug(f"[{self.source_name}] Esperando a que React dibuje la página {paginas_escaneadas + 1}...")
+            await asyncio.sleep(8)  # Le damos tiempo al servidor de Quarto
 
-            try:
-                # Esperamos a que carguen las tarjetas de React
-                await page.wait_for_selector("div[status='active'][type='quarto']", timeout=15000)
-            except Exception:
-                logger.warning(
-                    f"[{self.source_name}] Timeout esperando tarjetas React en {current_url}. Puede ser la última página.")
-                break
+            # Scroll Suave para Lazy Loading
+            for _ in range(3):
+                await page.evaluate("window.scrollBy(0, 800)")
+                await asyncio.sleep(1)
 
-            tarjetas = await page.locator("div[status='active'][type='quarto']").all()
+            # Extraemos todo
+            todos_los_enlaces = await page.locator("a").all()
+            enlaces_validos = 0
 
-            for tarjeta in tarjetas:
-                # En Quarto, a veces la tarjeta entera es un enlace o tiene un 'a' padre
-                enlace_loc = tarjeta.locator("xpath=ancestor::a").first
-                if await enlace_loc.count() > 0:
-                    href = await enlace_loc.get_attribute("href")
-                    if href and not href.startswith("http"):
+            for enlace in todos_los_enlaces:
+                try:
+                    href = await enlace.get_attribute("href")
+                    if not href: continue
+
+                    if not href.startswith("http"):
                         href = urljoin(self.base_url, href)
 
-                    precio_limpio = None
-                    try:
-                        # Extraemos el texto completo y buscamos el patrón de precio (ej. $350.00)
-                        texto_tarjeta = await tarjeta.inner_text(timeout=2000)
-                        match = re.search(r'\$\s*([\d\.,]+)', texto_tarjeta)
+                    if any(palabra in href.lower() for palabra in ["/propiedad", "/inmueble", "/detalle", "/p/"]):
+                        if href in urls_vistas: continue
+
+                        texto_completo = await enlace.inner_text(timeout=1000)
+                        precio_limpio = None
+                        match = re.search(r'(?:\$|USD)\s*([\d\.,]+)', texto_completo, re.IGNORECASE)
                         if match:
                             precio_str = match.group(1).replace(',', '')
                             precio_limpio = float(precio_str)
-                    except Exception:
-                        pass
 
-                    if href and href not in urls_vistas:
                         urls_vistas.add(href)
                         inmuebles_encontrados.append({
                             "url": href,
                             "precio": precio_limpio,
-                            "titulo": ""  # Quarto no lo hace fácil en el grid, lo sacaremos en la Fase B
+                            "titulo": "Pendiente (Fase B)"
                         })
+                        enlaces_validos += 1
+                except Exception:
+                    pass
 
+            logger.info(f"[{self.source_name}] Enlaces extraídos en página {paginas_escaneadas + 1}: {enlaces_validos}")
             paginas_escaneadas += 1
 
-            # Paginación: técnica genérica por query params
-            if "&page=" in current_url:
-                current_page = int(re.search(r'&page=(\d+)', current_url).group(1))
-                current_url = re.sub(r'&page=\d+', f'&page={current_page + 1}', current_url)
+            # --- LA MAGIA SPA: Clicar en Siguiente SIN recargar ---
+            # Seleccionamos botones típicos de librerías como Material UI o Bootstrap que usa React
+            siguiente_btn = page.locator(
+                "button[aria-label='Next page'], a[aria-label='Next page'], ul.pagination li:last-child a, .MuiPaginationItem-next")
+
+            if await siguiente_btn.count() > 0:
+                # Verificamos por Javascript si el botón está deshabilitado (llegamos a la última página)
+                is_disabled = await siguiente_btn.first.evaluate(
+                    "node => node.disabled || node.classList.contains('disabled')")
+
+                if not is_disabled:
+                    logger.info(f"[{self.source_name}] -> Haciendo clic en 'Siguiente' internamente...")
+                    await siguiente_btn.first.click()
+                    # NO hacemos goto(). Solo esperamos a que React re-dibuje la pantalla
+                    await asyncio.sleep(5)
+                else:
+                    logger.info(
+                        f"[{self.source_name}] Botón 'Siguiente' detectado como inactivo. Fin de la paginación.")
+                    break
             else:
-                current_url = f"{current_url}&page=2"
+                logger.info(f"[{self.source_name}] No se encontró botón 'Siguiente'. Fin de la paginación.")
+                break
 
         return inmuebles_encontrados
 
-    # BUG CORREGIDO 2: Agregada la variable titulo_base que faltaba
+
     async def _extraer_detalle(self, page: Page, url: str, precio_base: float, titulo_base: str):
         await page.goto(url, timeout=60000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except:
+            pass
 
-        # 1. Extraer ID de la URL (Quarto suele tener la URL como /propiedades/alquiler/12345)
         external_id = url.split("/")[-1].split("?")[0]
-
         builder = PropertySnapshotBuilder(source_name=self.source_name, external_id=external_id, url=url)
 
         if precio_base: builder.set_price(precio_base, "USD")
 
-        # 2. Título (h1)
-        titulo = titulo_base
         try:
-            titulo = await page.locator("h1").inner_text(timeout=5000)
-        except Exception:
-            pass
+            titulo = await page.locator("h1").inner_text(timeout=3000)
+        except:
+            titulo = titulo_base
 
-        # 3. Descripción
         descripcion_limpia = None
         try:
-            descripcion_limpia = await page.locator("section:has(h2:has-text('Descripción')) p").inner_text(
-                timeout=3000)
-        except Exception:
+            # Estrategia más amplia para la descripción
+            desc_locs = await page.locator("p").all_inner_texts()
+            # Tomamos el párrafo más largo como descripción
+            if desc_locs:
+                descripcion_limpia = max(desc_locs, key=len)
+        except:
             pass
 
         builder.set_general_info(titulo=titulo, descripcion=descripcion_limpia)
 
-        # 4. Ubicación (Del título "Los Dos Caminos, Mun Sucre #245")
-        if titulo:
+        if titulo and titulo != "Extraer en detalle":
             partes = [p.strip() for p in titulo.split(",")]
             urbanismo = partes[0] if len(partes) > 0 else ""
             municipio = partes[1].replace("Mun ", "").split("#")[0].strip() if len(partes) > 1 else "Caracas"
             builder.set_location(municipio=municipio, urbanismo=urbanismo)
 
-        # 5. Características Dinámicas
         try:
-            caracteristicas = await page.locator("section:has(h2:has-text('Características')) p").all_inner_texts()
+            # Buscamos características en todo el texto del cuerpo
+            texto_body = await page.locator("body").inner_text()
+
             amenidades_validas = []
 
-            for c in caracteristicas:
-                # El texto viene tipo "Habitaciones : 1" o "Piscina : No"
-                partes = c.split(":")
-                if len(partes) == 2:
-                    llave = partes[0].strip().lower()
-                    valor = partes[1].strip().lower()
+            # Buscamos "Habitaciones 3" o "3 Habitaciones"
+            hab_match = re.search(r'(\d+)\s*habitaci', texto_body, re.IGNORECASE)
+            if hab_match: builder.add_features(habitaciones=int(hab_match.group(1)))
 
-                    if "m2" in llave:
-                        m2_val = float(re.search(r'\d+', valor).group()) if re.search(r'\d+', valor) else None
-                        builder.add_features(m2_totales=m2_val)
-                    elif "habitaciones" in llave:
-                        hab_val = int(re.search(r'\d+', valor).group()) if re.search(r'\d+', valor) else None
-                        builder.add_features(habitaciones=hab_val)
-                    elif "baños" in llave:
-                        bano_val = float(re.search(r'\d+', valor).group()) if re.search(r'\d+', valor) else None
-                        builder.add_features(banos=bano_val)
-                    else:
-                        if valor == "si":
-                            amenidades_validas.append(partes[0].strip())
+            bano_match = re.search(r'(\d+)\s*baño', texto_body, re.IGNORECASE)
+            if bano_match: builder.add_features(banos=float(bano_match.group(1)))
 
-            if amenidades_validas:
-                builder.add_extra_data("amenidades", amenidades_validas)
-        except Exception:
+            m2_match = re.search(r'(\d+)\s*m2', texto_body, re.IGNORECASE)
+            if m2_match: builder.add_features(m2_totales=float(m2_match.group(1)))
+
+        except:
             pass
 
         return builder.build()
