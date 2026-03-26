@@ -80,7 +80,13 @@ def ejecutar_pipeline_limpieza():
     df = df_residencial[mask_alquiler_res | df_residencial['es_alquiler_inferido']].copy()
 
     # 3. Transformación: Aplanado JSON
+    logger.info("Aplanando variables JSON...")
     df_ubi = df['ubicacion'].apply(parse_json_column).apply(pd.Series)
+
+    # NUEVO: Asegurar que extraemos coordenadas limpias
+    if 'latitud' in df_ubi.columns and 'longitud' in df_ubi.columns:
+        df['latitud'] = pd.to_numeric(df_ubi['latitud'], errors='coerce')
+        df['longitud'] = pd.to_numeric(df_ubi['longitud'], errors='coerce')
     df_carac = df['caracteristicas'].apply(parse_json_column).apply(pd.Series)
     df = pd.concat([df, df_ubi, df_carac], axis=1).drop(columns=['ubicacion', 'caracteristicas'])
 
