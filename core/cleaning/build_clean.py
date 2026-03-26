@@ -3,6 +3,7 @@ import pandas as pd
 import ast
 import os
 import logging
+import numpy as np
 
 # Configuración del logger
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,7 +19,6 @@ def parse_json_column(texto):
 
 
 def extraer_lista_amenidades(texto):
-    """Busca y extrae la lista de amenidades y las convierte a minúsculas para buscar fácil."""
     try:
         data = ast.literal_eval(str(texto))
         if isinstance(data, dict):
@@ -39,16 +39,12 @@ def ejecutar_pipeline_limpieza():
 
     logger.info("Iniciando pipeline de limpieza de datos (Capa Bronce -> Capa Oro)...")
 
-    if not os.path.exists(db_cruda):
-        logger.error(f"No se encontró la base de datos origen en: {db_cruda}")
-        return
-
-    # 1. Extracción
-    logger.info("1. Extrayendo datos crudos...")
+    # 1. Extracción (AHORA CON inmueble_id y snapshot_id EXPLICITOS)
     conn_cruda = sqlite3.connect(db_cruda)
     query = """
     SELECT 
-        i.source_name as portal, i.external_id, s.id as snapshot_id,
+        i.id as inmueble_id, s.id as snapshot_id,
+        s.titulo, i.source_name as portal, i.external_id, 
         s.precio, s.moneda, s.ubicacion, s.caracteristicas,
         s.raw_extra_data as amenidades, s.scraped_at as fecha_registro
     FROM inmuebles i JOIN inmuebles_snapshots s ON i.id = s.inmueble_id
@@ -56,45 +52,56 @@ def ejecutar_pipeline_limpieza():
     df = pd.read_sql_query(query, conn_cruda)
     conn_cruda.close()
 
-    # 2. Transformación: Aplanado JSON
-    logger.info("2. Aplanando estructuras JSON (Ubicación y Características)...")
+    registros_iniciales = len(df)
+
+    # 2. Filtrado Lógico y Estadístico (Método de Tukey)
+    logger.info("Aplicando filtros de operación (Residencial y Alquiler)...")
+    df['titulo_lower'] = df['titulo'].astype(str).str.lower()
+    df['es_nulo'] = df['titulo'].isna() | (df['titulo'] == '') | (df['titulo_lower'] == 'nan') | (
+                df['titulo_lower'] == 'none')
+
+    # Eliminar inmuebles comerciales primero
+    mask_comercial = df['titulo_lower'].str.contains('local|galpón|galpon|comercio|oficina|terreno|consultorio',
+                                                     na=False)
+    df_residencial = df[~mask_comercial].copy()
+
+    mask_alquiler_res = df_residencial['titulo_lower'].str.contains('alquiler|arriendo', na=False)
+    mask_nulo_res = df_residencial['es_nulo']
+
+    alquileres_confirmados = df_residencial[mask_alquiler_res]['precio'].dropna()
+    Q1 = alquileres_confirmados.quantile(0.25)
+    Q3 = alquileres_confirmados.quantile(0.75)
+    limite_superior = Q3 + (3 * (Q3 - Q1))
+
+    df_residencial['es_alquiler_inferido'] = np.where(
+        mask_nulo_res & (df_residencial['precio'] <= limite_superior), True, False
+    )
+
+    df = df_residencial[mask_alquiler_res | df_residencial['es_alquiler_inferido']].copy()
+
+    # 3. Transformación: Aplanado JSON
     df_ubi = df['ubicacion'].apply(parse_json_column).apply(pd.Series)
     df_carac = df['caracteristicas'].apply(parse_json_column).apply(pd.Series)
     df = pd.concat([df, df_ubi, df_carac], axis=1).drop(columns=['ubicacion', 'caracteristicas'])
 
-    # 3. Transformación: Ingeniería de Amenidades (Top Descubiertas)
-    logger.info("3. Extrayendo variables de alto valor (Amenidades del Top)...")
+    # 4. Transformación: Ingeniería de Amenidades
     df['lista_amenidades'] = df['amenidades'].apply(extraer_lista_amenidades)
-
-    # Aquí definimos tu Top de amenidades detectadas.
-    # La clave es cómo se llamará la columna, el valor es qué palabra buscará.
     top_amenidades = {
-        'tiene_lavanderia': 'zona de lavandería',
-        'tiene_armarios': 'armarios empotrados',
-        'tiene_parque_infantil': 'parque infantil',
-        'tiene_planta_electrica': 'planta electrica',
-        'tiene_pozo': 'pozo',
-        'tiene_calentador': 'calentador',
-        'tiene_microondas': 'horno microndas',
-        'tiene_estudio': 'biblioteca/estudio',
-        'tiene_secadora': 'secadora',
-        'tiene_cable': 'cable',
-        'tiene_balcon': 'balcon terraza',
-        'tiene_piscina': 'piscina',  # Siempre buena tenerla
-        'tiene_vigilancia': 'vigilancia'  # Siempre buena tenerla
+        'tiene_lavanderia': 'zona de lavandería', 'tiene_armarios': 'armarios empotrados',
+        'tiene_parque_infantil': 'parque infantil', 'tiene_planta_electrica': 'planta electrica',
+        'tiene_pozo': 'pozo', 'tiene_calentador': 'calentador', 'tiene_microondas': 'horno microndas',
+        'tiene_estudio': 'biblioteca/estudio', 'tiene_secadora': 'secadora',
+        'tiene_cable': 'cable', 'tiene_balcon': 'balcon terraza',
+        'tiene_piscina': 'piscina', 'tiene_vigilancia': 'vigilancia'
     }
-
-    # Creamos las columnas dinámicamente
     for col_name, keyword in top_amenidades.items():
-        df[col_name] = df['lista_amenidades'].apply(
-            lambda lista: 1 if any(keyword in item for item in lista) else 0
-        )
+        df[col_name] = df['lista_amenidades'].apply(lambda lista: 1 if any(keyword in item for item in lista) else 0)
 
-    # Borramos la basura que ya no necesitamos
-    df = df.drop(columns=['amenidades', 'lista_amenidades'])
+    # Limpieza final conservando título y los IDs
+    columnas_basura = ['amenidades', 'lista_amenidades', 'titulo_lower', 'es_nulo', 'es_alquiler_inferido']
+    df = df.drop(columns=[col for col in columnas_basura if col in df.columns])
 
-    # 4. Transformación: Casteo y Limpieza
-    logger.info("4. Estandarizando tipos de datos numéricos...")
+    # 5. Transformación: Casteo Numérico
     for col in ['m2_totales', 'habitaciones', 'banos']:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -103,14 +110,13 @@ def ejecutar_pipeline_limpieza():
         df['municipio'] = df['municipio'].astype(str).str.strip().str.title()
         df.loc[df['municipio'].isin(['Nan', 'None']), 'municipio'] = None
 
-    # 5. Carga
-    logger.info(f"5. Guardando datos en Capa Oro ({db_limpia})...")
+    # 6. Carga en Capa Oro
     conn_limpia = sqlite3.connect(db_limpia)
-    # Al usar if_exists='replace', SOBRESCRIBE la tabla antigua con esta nueva estructura perfecta
+    # index=False omite el índice de Pandas, pero las columnas inmueble_id y snapshot_id se guardan perfectamente
     df.to_sql('inmuebles_limpios', conn_limpia, if_exists='replace', index=False)
     conn_limpia.close()
-
-    logger.info(f"✅ Pipeline completado. {len(df)} registros limpios exportados con sus amenidades separadas.")
+    logger.info(
+        f"✅ Pipeline Finalizado. Capa Oro lista con {len(df)} registros. IDs relacionales y título conservados.")
 
 
 if __name__ == "__main__":
